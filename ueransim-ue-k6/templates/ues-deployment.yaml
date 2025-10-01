@@ -1,0 +1,101 @@
+apiVersion: {{ include "common.capabilities.deployment.apiVersion" . }}
+kind: Deployment
+metadata:
+  name: {{ template "common.names.fullname" . }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels: {{- include "common.labels.standard" . | nindent 4 }}
+    {{- if .Values.commonLabels }}
+    {{- include "common.tplvalues.render" ( dict "value" .Values.commonLabels "context" $ ) | nindent 4 }}
+    {{- end }}
+    app.kubernetes.io/component: ues
+  {{- if .Values.commonAnnotations }}
+  annotations: {{- include "common.tplvalues.render" ( dict "value" .Values.commonAnnotations "context" $ ) | nindent 4 }}
+  {{- end }}
+spec:
+  selector:
+    matchLabels: {{ include "common.labels.matchLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ues
+  template:
+    metadata:
+      {{- if .Values.podAnnotations }}
+      annotations: {{- include "common.tplvalues.render" (dict "value" .Values.podAnnotations "context" $) | nindent 8 }}
+      {{- end }}
+      labels: {{- include "common.labels.standard" . | nindent 8 }}
+        {{- if .Values.podLabels }}
+        {{- include "common.tplvalues.render" (dict "value" .Values.podLabels "context" $) | nindent 8 }}
+        {{- end }}
+        app.kubernetes.io/component: ues
+    spec:
+      {{- include "ueransim.imagePullSecrets" . | nindent 6 }}
+      {{- if .Values.affinity }}
+      affinity: {{- include "common.tplvalues.render" ( dict "value" .Values.affinity "context" $) | nindent 8 }}
+      {{- end }}
+      {{- if .Values.nodeSelector }}
+      nodeSelector: {{- include "common.tplvalues.render" ( dict "value" .Values.nodeSelector "context" $) | nindent 8 }}
+      {{- end }}
+      {{- if .Values.tolerations }}
+      tolerations: {{- include "common.tplvalues.render" (dict "value" .Values.tolerations "context" .) | nindent 8 }}
+      {{- end }}
+      {{- if .Values.podSecurityContext.enabled }}
+      securityContext: {{- omit .Values.podSecurityContext "enabled" | toYaml | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ues
+          image: {{ template "ueransim.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN"]
+          env:
+            - name: GNB_HOSTNAME
+              value: {{ .Values.gnb.hostname }}
+          {{- if .Values.command }}
+          command: {{- include "common.tplvalues.render" (dict "value" .Values.command "context" $) | nindent 12 }}
+          {{- end }}
+          {{- if .Values.args }}
+          args: {{- include "common.tplvalues.render" (dict "value" .Values.args "context" $) | nindent 12 }}
+          {{- else }}
+          args:
+            - ue
+            - -n
+            - {{ .Values.count | quote }}
+          {{- end }}    
+          {{- if .Values.resources }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ueransim/ue.yaml
+              subPath: "ue.yaml"
+        - name: traffic-k6
+          image: grafana/k6:0.52.0
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -eu
+              # uesimtun0 대기
+              for i in $(seq 1 180); do ip link show uesimtun0 >/dev/null 2>&1 && FOUND=1 && break; sleep 1; done
+              if [ "${FOUND:-0}" = "0" ]; then echo "uesimtun0 not found; sleep"; sleep 60; exit 0; fi
+
+              UEIP=$(ip -4 addr show uesimtun0 | awk '/inet /{print $2}' | cut -d/ -f1)
+              echo "[k6] --local-ips=${UEIP}"
+
+              while true; do
+                # k6 실패해도 스크립트가 죽지 않게
+                k6 run --local-ips="${UEIP}" /scripts/script.js || echo "[k6] run failed; retrying"
+                sleep 30
+              done
+          resources:
+            requests: { cpu: "200m", memory: "128Mi" }
+            limits:   { cpu: "500m",    memory: "256Mi" }
+          volumeMounts:
+            - name: k6-script
+              mountPath: /scripts
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "common.names.fullname" . }}
+        - name: k6-script
+          configMap:
+            name: ue-k6-script 

@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ue.fullname" . }}-k6-script         # ← 이 이름이 volumes.configMap.name과 매칭됩니다
+  namespace: ue               # 네임스페이스 맞춰주세요
+data:
+  script.js: |
+    import http from 'k6/http';
+
+    export let options = {
+      scenarios: {
+        web: {
+          executor: 'constant-arrival-rate',
+          rate: 50,              // 초당 요청 수 (먼저 50부터, 점진 상승)
+          timeUnit: '1s',
+          duration: '10m',
+          preAllocatedVUs: 50,
+          maxVUs: 100,
+        },
+      },
+      // 연결 재사용 유지(기본값 false가 아님을 명시적으로)
+      noConnectionReuse: false,
+      noVUConnectionReuse: false,
+      // 내부 응답 바디 버리기 → 메모리/GC 감소
+      discardResponseBodies: true,
+    };
+
+    const BASE = 'http://10.98.186.111:80';   // 목표 URL/도메인 바꾸세요
+    export default function () {
+      http.get(BASE);
+      sleep(0.5 + Math.random());
+    }
