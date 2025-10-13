@@ -328,7 +328,9 @@ def main():
     end_rfc = to_rfc3339()
     start_rfc = to_rfc3339(datetime.now(timezone.utc) - timedelta(minutes=int(args.window.rstrip("m"))))
 
-    ue_num = 3
+    with open ('tmp/ue_num.json') as f:
+        data=json.load(f)
+        ue_num = data['num']
     ue_threshold = 290
     while True:
         end_ns = now_ns()
@@ -383,6 +385,9 @@ def main():
                 helm_ue_uninstall(i)
         ue_num += new_ue_num
         print(f'now we have {ue_num} nums of UEs')
+        with open ('tmp/ue_num.json', 'w') as f:
+            data = {'num': ue_num}
+            json.dump(data,f)
         time.sleep(int(args.interval.rstrip("m"))*60)
 
 if __name__ == "__main__":

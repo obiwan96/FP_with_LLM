@@ -143,7 +143,7 @@ def helm_upgrade_install(
 def check_core_function_alive(window: int=5):
     loki = LokiClient(loki_ip)
     recent_logs = loki.get_recent_logs('oai', window=window)
-    error_word = ['error', 'failure', 'disconnected']
+    error_word = ['[error]', '[critical]', '[fatal]']
     for single_log in recent_logs:
         for word in error_word:
             if word in single_log[1]:
