@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "ue.fullname" . }}-k6-script         # ← 이 이름이 volumes.configMap.name과 매칭됩니다
+  name: {{ include "common.names.fullname" . }}-k6-script         # ← 이 이름이 volumes.configMap.name과 매칭됩니다
   namespace: ue               # 네임스페이스 맞춰주세요
 data:
   script.js: |

@@ -135,7 +135,7 @@ class BaseHttpClient:
 # Prometheus
 # ------------------------------
 
-''' Usage:ㄴ
+''' Usage:
 prom = PrometheusClient("http://localhost:9090")
 
 start = to_rfc3339(datetime.now(timezone.utc) + minutes(-10))  # 10분 전
@@ -204,75 +204,57 @@ class PrometheusClient(BaseHttpClient):
 
 # ------------------------------
 # Loki
+# usage:
+# client = LokiClient("http://localhost:3100")
+# containers = client.get_containers_recently_logged("oai")
+# print(containers)  # 예: ['upf', 'amf', 'smf']
 # ------------------------------
-class LokiClient(BaseHttpClient):
-    def __init__(self, base_url: str, **kwargs):
-        super().__init__(HttpConfig(base_url=base_url, **kwargs))
 
-    def query(self, query: str,
-              time_: Optional[int] = None,
-              limit: Optional[int] = None,
-              direction: Optional[str] = None) -> dict:
-        params: Dict[str, Any] = {"query": query}
-        if time_ is not None:
-            params["time"] = str(time_)
-        if limit is not None:
-            params["limit"] = int(limit)
-        if direction:
-            params["direction"] = direction
-        return self._request("GET", "/loki/api/v1/query", params)
+class LokiClient:
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
 
-    def query_range(self,
-                    query: str,
-                    start: Optional[int] = None,
-                    end: Optional[int] = None,
-                    step: Optional[str] = None,
-                    limit: Optional[int] = None,
-                    direction: Optional[str] = None,
-                    regexp: Optional[str] = None) -> dict:
-        params: Dict[str, Any] = {"query": query}
-        if start is not None:
-            params["start"] = str(start)
-        if end is not None:
-            params["end"] = str(end)
-        if step:
-            params["step"] = step
-        if limit is not None:
-            params["limit"] = int(limit)
-        if direction:
-            params["direction"] = direction
-        if regexp:
-            params["regexp"] = regexp
-        return self._request("GET", "/loki/api/v1/query_range", params)
+    def _to_nanots(self, dt: datetime) -> int:
+        return int(dt.timestamp() * 1e9)
 
-    def labels(self, start: Optional[int] = None, end: Optional[int] = None) -> dict:
-        params: Dict[str, Any] = {}
-        if start is not None:
-            params["start"] = str(start)
-        if end is not None:
-            params["end"] = str(end)
-        return self._request("GET", "/loki/api/v1/labels", params)
+    def query_range(self, query: str, start: int, end: int, limit: int = 1000, direction: str = "backward"):
+        params = {
+            "query": query,
+            "start": start,
+            "end": end,
+            "limit": limit,
+            "direction": direction,
+        }
+        response = requests.get(f"{self.base_url}/loki/api/v1/query_range", params=params)
+        response.raise_for_status()
+        return response.json()
 
-    def series(self, match: List[str],
-               start: Optional[int] = None,
-               end: Optional[int] = None) -> dict:
-        params: List[tuple] = [("match[]", m) for m in match]
-        if start is not None:
-            params.append(("start", str(start)))
-        if end is not None:
-            params.append(("end", str(end)))
+    def get_containers_recently_logged(self, namespace: str):
+        now = datetime.utcnow()
+        start = now - timedelta(minutes=5)
+        logql = f'{{namespace="{namespace}"}}'
+        result = self.query_range(logql, start, now)
 
-        url = self.http.base_url.rstrip("/") + "/loki/api/v1/series"
-        r = requests.get(
-            url,
-            params=params,
-            headers=self._headers(),
-            auth=self._auth(),
-            timeout=self.http.timeout,
-            verify=self.http.verify_tls,
-        )
-        r.raise_for_status()
-        return r.json()
+        container_set = set()
+        for stream in result.get("data", {}).get("result", []):
+            labels = stream.get("stream", {})
+            container = labels.get("container")
+            if container:
+                container_set.add(container)
+        return list(container_set)
+
+    def get_recent_logs(self, namespace: str, container: str, limit: int = 100):
+        now = datetime.utcnow()
+        start = now - timedelta(minutes=5)
+        logql = f'{{namespace="{namespace}", container="{container}"}}'
+        result = self.query_range(logql, start, now, limit=limit)
+
+        logs = []
+        for stream in result.get("data", {}).get("result", []):
+            for ts, log in stream.get("values", []):
+                log_time = datetime.fromtimestamp(int(ts) / 1e9)
+                logs.append((log_time, log.strip()))
+        return logs
 
 # ------------------------------
 # (선택) pandas 변환

@@ -1,13 +1,10 @@
 """
-net_k8s_collectors.py
-
 Kubernetes 상의 UERANSIM(RAN) + OAI Core 환경을 가정하고,
 Prometheus(메트릭)와 Loki(로그)로부터 RAN/Transport/Core/App 지표를 수집하는 수집기.
-일부 트랜스포트/CDN 측정은 외부 툴(iperf3, ping, traceroute, tc) 실행을 래핑.
+일부 트랜스포트/CDN 측정은 외부 툴(iperf3, ping, traceroute, tc) 실행을 래핑 필요. 일단 보류.
 
 필요:
   pip install requests
-  (선택) pip install pandas
 
 외부 툴(필요 시):
   - iperf3, ping, traceroute(or mtr), tc, tcptraceroute, owping(또는 twamp 관련 툴)
@@ -28,9 +25,11 @@ import re
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
-
+import time
 from secret import *
 from Prome_helper import *
+from POD_management import *
+from InDB_helper import *
 
 # ------------------ Shell helpers ------------------
 def run(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
@@ -38,84 +37,35 @@ def run(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 # ======================= RAN =======================
-def parse_rsrp_sinr_from_logs(loki: LokiClient, ns: str, start_ns: int, end_ns: int,
-                              ue_selector: str = '{app="ueransim-ue"}') -> List[Dict[str, Any]]:
-    """
-    UERANSIM UE 로그 또는 gNB 로그에서 MeasurementReport를 파싱하여 (RSRP, SINR) 추출
-    LogQL 예: {namespace="oai", app="ueransim-ue"} |= "MeasurementReport"
-    """
-    query = f'{{namespace="{ns}"}} {ue_selector.replace("{", "|").replace("}", "|")} |= "MeasurementReport"'
-    # 더 안전하게는 라벨 셀렉터를 합치는 것이 좋지만, 환경에 맞게 수정
-    query = f'{{namespace="{ns}", app="ueransim-ue"}} |= "MeasurementReport"'
-    resp = loki.query_range(query=query, start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
-    results: List[Dict[str, Any]] = []
-    # 예시 로그 패턴 (환경에 맞게 조정):
-    # "RRC MeasurementReport: RSRP=-85 dBm, SINR=18 dB, PCI=123, CellId=..."
-    rsrp_re = re.compile(r'RSRP[=\s:-]+(-?\d+)', re.IGNORECASE)
-    sinr_re = re.compile(r'SINR[=\s:-]+(-?\d+)', re.IGNORECASE)
-    ue_id_re = re.compile(r'UE[ _-]?ID[=\s:-]+(\S+)', re.IGNORECASE)
-
-    for stream in resp.get("data", {}).get("result", []):
-        labels = stream.get("stream", {})
-        for ts, line in stream.get("values", []):
-            rsrp = rsrp_re.search(line)
-            sinr = sinr_re.search(line)
-            ueid = ue_id_re.search(line)
-            if rsrp or sinr:
-                results.append({
-                    "timestamp_ns": int(ts),
-                    "ue_id": (ueid.group(1) if ueid else labels.get("pod")),
-                    "rsrp_dbm": (int(rsrp.group(1)) if rsrp else None),
-                    "sinr_db": (int(sinr.group(1)) if sinr else None),
-                    **labels
-                })
-    return results
-
-
-def rrc_state_counts(loki: LokiClient, ns: str, start_ns: int, end_ns: int,
-                     gnb_selector: str = '{app="oai-gnb"}') -> Dict[str, int]:
+def rrc_state_counts(loki: LokiClient, start_ns: int, end_ns: int, 
+                     counts: int = 0,
+                     ns: str= 'oai', 
+                     gnb_selector: str = 'container="gnodeb"') -> int:
     """
     AMF/gNB 로그에서 RRC 상태 변화를 카운트 (CONNECTED/IDLE 등)
     예시 키워드: "RRC_CONNECTED", "RRC_IDLE"
     """
-    query = f'{{namespace="{ns}", app="oai-gnb"}} |= "RRC_"'
-    resp = loki.query_range(query=query, start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
-    counts = {"CONNECTED": 0, "IDLE": 0, "INACTIVE": 0}
+    query = f'{{namespace="{ns}", {gnb_selector}}}'
+    resp = loki.query_range(query=query, start=start_ns, end=end_ns)
     for stream in resp.get("data", {}).get("result", []):
-        for ts, line in stream.get("values", []):
-            if "RRC_CONNECTED" in line:
-                counts["CONNECTED"] += 1
-            elif "RRC_IDLE" in line:
-                counts["IDLE"] += 1
-            elif "RRC_INACTIVE" in line or "INACTIVE" in line:
-                counts["INACTIVE"] += 1
+        for _, line in stream.get("values", []):
+            if "RRC Setup for UE" in line:
+                counts += 1
+            elif "Releasing RRC connection for UE" in line:
+                counts -= 1
     return counts
 
+def ue_fail_state_counts(loki: LokiClient, start_ns: int, end_ns: int, 
+                     ns: str= 'ue') -> int:
+    query = f'{{namespace="{ns}"}}'
+    resp = loki.query_range(query=query, start=start_ns, end=end_ns, limit=1000)
+    fail_num=0
+    for stream in resp.get("data", {}).get("result", []):
+        for _, line in stream.get("values", []):
+            if "selection failure" in line:
+                fail_num += 1
+    return fail_num
 
-def cell_congestion_level(prom: PrometheusClient, prb_metric: str, ns: str, gnb: Optional[str],
-                          start_rfc3339: str, end_rfc3339: str, step: str = "30s") -> Dict[str, Any]:
-    """
-    gNB PRB 사용률 기반 혼잡도 계산. Prometheus에 노출되는 지표명이 환경마다 다름.
-    예: prb_metric="oai_gnb_prb_used_ratio" (0~1)
-    """
-    match = f'{prb_metric}{{namespace="{ns}"' + (f', pod="{gnb}"' if gnb else "") + "}}"
-    resp = prom.query_range(match, start=start_rfc3339, end=end_rfc3339, step=step)
-    # 간단 혼잡도 규칙: <=0.5: Low, <=0.8: Medium, >0.8: High (시간 평균)
-    vals = []
-    for it in resp.get("data", {}).get("result", []):
-        for ts, v in it.get("values", []):
-            try:
-                vals.append(float(v))
-            except Exception:
-                pass
-    avg = sum(vals)/len(vals) if vals else 0.0
-    if avg > 0.8:
-        level = "High"
-    elif avg > 0.5:
-        level = "Medium"
-    else:
-        level = "Low"
-    return {"avg_prb_usage": avg, "level": level, "samples": len(vals)}
 '''
 # =================== TRANSPORT =====================
 def one_way_latency_udp(sender: Optional[str], receiver: Optional[str], count: int = 100, port: int = 8622,
@@ -363,53 +313,60 @@ def main():
     ap.add_argument("--ns", default='oai', help="Kubernetes namespace (e.g., oai)")
     ap.add_argument("--upf_pod", help="UPF pod name label value (optional)")
     ap.add_argument("--iface", default="eth0", help="Interface for tc stats")
-    ap.add_argument("--window", default="15m", help="Lookback window (e.g., 15m)")
+    ap.add_argument("--window", default="5m", help="Lookback window (e.g., 15m)")
+    ap.add_argument("--interval", default="1m", help="Data collection interval (e.g., 1m)")
     ap.add_argument("--step", default="30s", help="Prometheus step")
     ap.add_argument("--run", default="all", help="What to run: ran,transport,core,app,all")
     args = ap.parse_args()
+
 
     prom = PrometheusClient(args.prom)
     loki = LokiClient(args.loki)
 
     end_rfc = to_rfc3339()
     start_rfc = to_rfc3339(datetime.now(timezone.utc) - timedelta(minutes=int(args.window.rstrip("m"))))
-    end_ns = now_ns()
-    start_ns = now_ns(minutes(-int(args.window.rstrip("m"))))
 
-    out: Dict[str, Any] = {}
+    while True:
+        end_ns = now_ns()
+        start_ns = now_ns(minutes(-int(args.window.rstrip("m"))))
 
-    if args.run in ("ran", "all"):
-        out["ran"] = {
-            "rsrp_sinr": parse_rsrp_sinr_from_logs(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
-            "rrc_state_counts": rrc_state_counts(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
-            "cell_congestion": cell_congestion_level(prom, prb_metric="oai_gnb_prb_used_ratio", ns=args.ns, gnb=None,
-                                                     start_rfc3339=start_rfc, end_rfc3339=end_rfc, step=args.step),
-        }
-    '''
-    if args.run in ("transport", "all"):
-        out["transport"] = {
-            "udp_iperf3": {"note": "Run iperf3 server before using", **iperf3_udp_loss("127.0.0.1")},
-            "queue": queue_occupancy_tc(args.iface),
-        }
-    '''
+        out: Dict[str, Any] = {}
 
-    if args.run in ("core", "all"):
-        out["core"] = {
-            "pdu_session_delay": pdu_session_delay(loki, ns=args.ns, imsi=None, start_ns=start_ns, end_ns=end_ns),
-            "amf_registration_rate": amf_registration_rate(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
-            "upf_throughput": upf_userplane_throughput(prom, ns=args.ns, upf_pod=args.upf_pod),
-            "smf_session_drop": smf_session_drop_count(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
-        }
+        rrc_count = 0
+        if args.run in ("ran", "all"):
+            out["ran"] = {
+                "rrc_state_counts": rrc_state_counts(loki, start_ns=start_ns, end_ns=end_ns, counts= rrc_count),
+                "ue_failure_counts": ue_fail_state_counts(loki, start_ns=start_ns,end_ns=end_ns)
+            }
+        '''
+        if args.run in ("transport", "all"):
+            out["transport"] = {
+                "udp_iperf3": {"note": "Run iperf3 server before using", **iperf3_udp_loss("127.0.0.1")},
+                "queue": queue_occupancy_tc(args.iface),
+            }
+        '''
 
-    if args.run in ("app", "all"):
-        out["app"] = {
-            "qoe": qoe_from_logs(loki, ns='application', start_ns=start_ns, end_ns=end_ns),
-            "buffer_underrun": buffer_underrun_from_logs(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
-            "cdn_rtt": cdn_rtt_targets(["edge.example.cdn", "edge2.example.cdn"]),
-        }
+        if args.run in ("core", "all"):
+            out["core"] = {
+                "pdu_session_delay": pdu_session_delay(loki, ns=args.ns, imsi=None, start_ns=start_ns, end_ns=end_ns),
+                "amf_registration_rate": amf_registration_rate(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
+                "upf_throughput": upf_userplane_throughput(prom, ns=args.ns, upf_pod=args.upf_pod),
+                "smf_session_drop": smf_session_drop_count(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
+            }
 
-    print(p.dumps(out, ensure_ascii=False, indent=2))
+        if args.run in ("app", "all"):
+            out["app"] = {
+                "qoe": qoe_from_logs(loki, ns='application', start_ns=start_ns, end_ns=end_ns),
+                "buffer_underrun": buffer_underrun_from_logs(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
+                "cdn_rtt": cdn_rtt_targets(["edge.example.cdn", "edge2.example.cdn"]),
+            }
 
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        abnormality = check_core_function_alive()
+        for metric_name in out.keys():
+            for field_name in out[metric_name]:
+                InDB_write(metric_name, field_name, abnormality)
+        time.sleep(int(args.interval.rstrip("m"))*60)
 
 if __name__ == "__main__":
     main()

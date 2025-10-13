@@ -98,4 +98,4 @@ spec:
             name: {{ include "common.names.fullname" . }}
         - name: k6-script
           configMap:
-            name: ue-k6-script 
+            name: {{ include "common.names.fullname" . }}-k6-script 

@@ -20,7 +20,7 @@ image:
   debug: false
 name: ueransim-ue
 count: 1
-initialMSISDN: '0000000106'
+initialMSISDN: '0000000100'
 mcc: '001'
 mnc: '01'
 key: fec86ba6eb707ed08905757b1bb44b8f

@@ -87,18 +87,18 @@ def convert_IMSI(IMSI: int) -> str:
     # e.g. 100 -> 0000000100
     return f"{IMSI:010d}"
 
-def modify_values_file(IMSI: int):
+def modify_ue_values_file(IMSI: int):
     base_values = load_yaml(Path(helm_repo_path) / 'values.yaml')
     set_by_path(base_values, 'initialMSISDN', convert_IMSI(IMSI))
     dump_yaml(base_values, Path(helm_repo_path) / 'values.yaml')
 
-def helm_repo_install(ue_num:int):
+def helm_ue_install(ue_num:int):
     IMSI = 99+ue_num
-    modify_values_file(IMSI)
+    modify_ue_values_file(IMSI)
     cmd = ["helm", "install", f"ueransim-ue{ue_num}", helm_repo_path, "-n", "ue"]
     run_cmd(cmd)
 
-def helm_repo_uninstall(ue_num:int):
+def helm_ue_uninstall(ue_num:int):
     cmd = ["helm", "uninstall", f"ueransim-ue{ue_num}", "-n", "ue"]
     run_cmd(cmd)
 
@@ -137,6 +137,9 @@ def helm_upgrade_install(
     run_cmd(cmd)
     logging.info("Helm 설치/업그레이드 완료")
 
+
+def check_core_function_alive():
+    return False
 
 # ------------------------------
 # K8s Pod 대기 & Exec
