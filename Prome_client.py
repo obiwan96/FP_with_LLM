@@ -30,6 +30,7 @@ from secret import *
 from Prome_helper import *
 from POD_management import *
 from InDB_helper import *
+import random
 
 # ------------------ Shell helpers ------------------
 def run(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
@@ -130,7 +131,7 @@ def queue_occupancy_tc(iface: str) -> Dict[str, Any]:
     }
 '''
 # ================== CORE NETWORK ===================
-def pdu_session_delay(loki: LokiClient, ns: str, imsi: Optional[str], start_ns: int, end_ns: int) -> Dict[str, Any]:
+def pdu_session_delay(loki: LokiClient, imsi: Optional[str], start_ns: int, end_ns: int, ns: str='oai') -> Dict[str, Any]:
     """
     AMF/SMF/UPF 각 로그에서 동일 세션(IMSI/SUPI/SessionID)의 주요 이벤트 타임스탬프 간 차이를 계산.
     패턴은 환경 로그 포맷에 맞게 조정 필요.
@@ -168,7 +169,7 @@ def pdu_session_delay(loki: LokiClient, ns: str, imsi: Optional[str], start_ns: 
     }
 
 
-def amf_registration_rate(loki: LokiClient, ns: str, start_ns: int, end_ns: int) -> Dict[str, Any]:
+def amf_registration_rate(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai') -> Dict[str, Any]:
     """
     AMF 로그에서 Registration 성공/실패 카운트.
     예시 키워드: "Registration accept", "Registration reject"
@@ -187,7 +188,8 @@ def amf_registration_rate(loki: LokiClient, ns: str, start_ns: int, end_ns: int)
     return {"ok": ok, "fail": fail, "rate": rate}
 
 
-def upf_userplane_throughput(prom: PrometheusClient, ns: str, upf_pod: Optional[str],
+def upf_userplane_throughput(prom: PrometheusClient, upf_pod: Optional[str],
+                             ns: str='oai',
                              metric_tx: str = 'container_network_transmit_bytes_total',
                              metric_rx: str = 'container_network_receive_bytes_total',
                              step: str = "30s", window: str = "5m") -> Dict[str, Any]:
@@ -212,7 +214,7 @@ def upf_userplane_throughput(prom: PrometheusClient, ns: str, upf_pod: Optional[
     return {"tx_bps": last_avg(r_tx), "rx_bps": last_avg(r_rx)}
 
 
-def smf_session_drop_count(loki: LokiClient, ns: str, start_ns: int, end_ns: int) -> Dict[str, Any]:
+def smf_session_drop_count(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai') -> Dict[str, Any]:
     """
     SMF 제어 로그에서 세션 drop/release 판단. 키워드 조정 필요.
     """
@@ -326,6 +328,8 @@ def main():
     end_rfc = to_rfc3339()
     start_rfc = to_rfc3339(datetime.now(timezone.utc) - timedelta(minutes=int(args.window.rstrip("m"))))
 
+    ue_num = 3
+    ue_threshold = 290
     while True:
         end_ns = now_ns()
         start_ns = now_ns(minutes(-int(args.window.rstrip("m"))))
@@ -366,6 +370,19 @@ def main():
         for metric_name in out.keys():
             for field_name in out[metric_name]:
                 InDB_write(metric_name, field_name, abnormality)
+        new_ue_num = random.randrange(-5,8)
+        if new_ue_num+ue_num<0:
+            new_ue_num = 2
+        elif new_ue_num+ue_num>ue_threshold:
+            new_ue_num = -20
+        if new_ue_num>0:
+            for i in range(ue_num+1, ue_num+new_ue_num+1):
+                helm_ue_install(i)
+        elif new_ue_num<0:
+            for i in range(ue_num+new_ue_num+1, ue_num+1):
+                helm_ue_uninstall(i)
+        ue_num += new_ue_num
+        print(f'now we have {ue_num} nums of UEs')
         time.sleep(int(args.interval.rstrip("m"))*60)
 
 if __name__ == "__main__":

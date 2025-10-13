@@ -41,6 +41,8 @@ from kubernetes.stream import stream
 
 from kubernetes import client, config
 from kubernetes.stream import stream
+from Prome_helper import *
+from secret import loki_ip
 
 helm_repo_path='ueransim-ue-k6'
 # ------------------------------
@@ -81,7 +83,7 @@ def load_yaml(path: Path):
 
 def dump_yaml(data: dict, path: Path):
     with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False)
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True, default_style="'")
 
 def convert_IMSI(IMSI: int) -> str:
     # e.g. 100 -> 0000000100
@@ -138,7 +140,15 @@ def helm_upgrade_install(
     logging.info("Helm 설치/업그레이드 완료")
 
 
-def check_core_function_alive():
+def check_core_function_alive(window: int=5):
+    loki = LokiClient(loki_ip)
+    recent_logs = loki.get_recent_logs('oai', window=window)
+    error_word = ['error', 'failure', 'disconnected']
+    for single_log in recent_logs:
+        for word in error_word:
+            if word in single_log[1]:
+                print(f'error occured! :{single_log}')
+                return True
     return False
 
 # ------------------------------

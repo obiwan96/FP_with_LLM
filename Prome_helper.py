@@ -243,10 +243,13 @@ class LokiClient:
                 container_set.add(container)
         return list(container_set)
 
-    def get_recent_logs(self, namespace: str, container: str, limit: int = 100):
-        now = datetime.utcnow()
-        start = now - timedelta(minutes=5)
-        logql = f'{{namespace="{namespace}", container="{container}"}}'
+    def get_recent_logs(self, namespace: str, container: str=None, limit: int = 2000, window: int=5):
+        now = now_ns()
+        start = now_ns(minutes(-window))
+        if container:
+            logql = f'{{namespace="{namespace}", container="{container}"}}'
+        else:
+            logql = f'{{namespace="{namespace}"}}'
         result = self.query_range(logql, start, now, limit=limit)
 
         logs = []

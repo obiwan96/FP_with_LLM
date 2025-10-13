@@ -1,53 +1,53 @@
-global:
-  imageRegistry: ''
-  imagePullSecrets: []
-  storageClass: ''
-  nodeSelector: &id001
-    kubernetes.io/hostname: kube-167
-kubeVersion: ''
-nameOverride: ''
-fullnameOverride: ''
-commonLabels: {}
-commonAnnotations: {}
-clusterDomain: cluster.local
-extraDeploy: []
-image:
-  registry: docker.io
-  repository: gradiant/ueransim
-  tag: 3.2.6
-  pullPolicy: Always
-  pullSecrets: []
-  debug: false
-name: ueransim-ue
-count: 1
-initialMSISDN: '0000000100'
-mcc: '001'
-mnc: '01'
-key: fec86ba6eb707ed08905757b1bb44b8f
-op: C42449363BBAD02B66D16BC975D77CC1
-opType: OPC
-gnb:
-  hostname: ueransim-gnb
-sst: 1
-sd: '0xFFFFFF'
-apnList:
-- type: IPv4
-  apn: oai
-  slice:
-    sst: 1
-    sd: '0xFFFFFF'
-  emergency: false
-command: []
-args: []
-resources:
-  limits: {}
-  requests: {}
-podSecurityContext:
-  enabled: false
-containerSecurityContext:
-  enabled: false
-podLabels: {}
-podAnnotations: {}
-affinity: {}
-nodeSelector: *id001
-tolerations: []
+'global':
+  'imageRegistry': ''
+  'imagePullSecrets': []
+  'storageClass': ''
+  'nodeSelector': &id001
+    'kubernetes.io/hostname': 'kube-167'
+'kubeVersion': ''
+'nameOverride': ''
+'fullnameOverride': ''
+'commonLabels': {}
+'commonAnnotations': {}
+'clusterDomain': 'cluster.local'
+'extraDeploy': []
+'image':
+  'registry': 'docker.io'
+  'repository': 'gradiant/ueransim'
+  'tag': '3.2.6'
+  'pullPolicy': 'Always'
+  'pullSecrets': []
+  'debug': !!bool 'false'
+'name': 'ueransim-ue'
+'count': !!int '1'
+'initialMSISDN': '0000000108'
+'mcc': '001'
+'mnc': '01'
+'key': 'fec86ba6eb707ed08905757b1bb44b8f'
+'op': 'C42449363BBAD02B66D16BC975D77CC1'
+'opType': 'OPC'
+'gnb':
+  'hostname': 'ueransim-gnb'
+'sst': !!int '1'
+'sd': '0xFFFFFF'
+'apnList':
+- 'type': 'IPv4'
+  'apn': 'oai'
+  'slice':
+    'sst': !!int '1'
+    'sd': '0xFFFFFF'
+  'emergency': !!bool 'false'
+'command': []
+'args': []
+'resources':
+  'limits': {}
+  'requests': {}
+'podSecurityContext':
+  'enabled': !!bool 'false'
+'containerSecurityContext':
+  'enabled': !!bool 'false'
+'podLabels': {}
+'podAnnotations': {}
+'affinity': {}
+'nodeSelector': *id001
+'tolerations': []
