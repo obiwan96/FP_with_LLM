@@ -10,22 +10,7 @@ from typing import Any, Dict, List, Optional, Union  # 3.9 호환
 
 import requests
 from requests.auth import HTTPBasicAuth
-
-__all__ = [
-    "PrometheusClient",
-    "LokiClient",
-    "to_rfc3339",
-    "to_epoch",
-    "now_rfc3339",
-    "now_epoch",
-    "now_ns",
-    "minutes",
-    "hours",
-    "days",
-    "ns",
-    "maybe_pandas_dataframe_from_prometheus",
-    "maybe_pandas_dataframe_from_loki",
-]
+import re
 
 # ------------------------------
 # 시간 헬퍼
@@ -130,6 +115,49 @@ class BaseHttpClient:
                     time.sleep(self.http.backoff * attempt)
                 else:
                     raise
+
+# ------------------------------
+# Core function log reading
+# ------------------------------
+
+def extract_supi(line: str) -> str:
+    """
+    Extract SUPI (IMSI) from a log line.
+    Examples:
+      - "SUPI imsi-001010000000106" → "001010000000106"
+      - "SUPI 1010000000106" → "1010000000106"
+    """
+    match = re.search(r"SUPI[\s:=\-]*((imsi-)?(\d{10,15}))", line)
+    if match:
+        return int(match.group(3))  # 숫자만 반환
+    return None
+
+def get_amf_request_times(amf_logs: List[tuple[datetime, str]]) -> Dict[str, datetime]:
+    """
+    Extract T_request per SUPI from AMF logs.
+    """
+    supi_to_time = {}
+    for ts, line in amf_logs:
+        if "Handle PDU Session Establishment Request" in line:
+            supi = extract_supi(line)
+            #print(f'find supi {supi} in amf log')
+            if supi and supi not in supi_to_time:
+                supi_to_time[supi] = ts
+    return supi_to_time
+
+def get_smf_accept_times(smf_logs: List[tuple[datetime, str]]) -> Dict[str, datetime]:
+    """
+    Extract T_accept per SUPI from SMF logs.
+    """
+    supi_to_time = {}
+    for ts, line in smf_logs:
+        if "triger PDU_SES_EST" in line:
+            supi = extract_supi(line)
+            #print(f'find supi {supi} in smf log')
+            if supi and supi not in supi_to_time:
+                supi_to_time[supi] = ts
+    return supi_to_time
+
 
 # ------------------------------
 # Prometheus
@@ -263,6 +291,7 @@ class LokiClient:
                     "log": log.strip()
                 })
         return logs
+
 
 # ------------------------------
 # (선택) pandas 변환

@@ -30,12 +30,16 @@ from secret import *
 from Prome_helper import *
 from POD_management import *
 from InDB_helper import *
-import random
 
 # ------------------ Shell helpers ------------------
 def run(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
     proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
     return proc.returncode, proc.stdout, proc.stderr
+def ns_to_nano(dt: datetime) -> int:
+    return int(dt.timestamp() * 1e9)
+
+def parse_ts(ts_str: str) -> datetime:
+    return datetime.fromtimestamp(int(ts_str) / 1e9)
 
 # ======================= RAN =======================
 def rrc_state_counts(loki: LokiClient, start_ns: int, end_ns: int, 
@@ -131,42 +135,50 @@ def queue_occupancy_tc(iface: str) -> Dict[str, Any]:
     }
 '''
 # ================== CORE NETWORK ===================
-def pdu_session_delay(loki: LokiClient, imsi: Optional[str], start_ns: int, end_ns: int, ns: str='oai') -> Dict[str, Any]:
+def pdu_session_delay(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai'):
     """
     AMF/SMF/UPF 각 로그에서 동일 세션(IMSI/SUPI/SessionID)의 주요 이벤트 타임스탬프 간 차이를 계산.
-    패턴은 환경 로그 포맷에 맞게 조정 필요.
     """
-    patterns = {
-        "amf_req": re.compile(r"(PDU Session Establishment Request|NAS\spdu.*establish)", re.IGNORECASE),
-        "smf_sel": re.compile(r"Select SMF|Nsmf_PDUSession", re.IGNORECASE),
-        "upf_rule": re.compile(r"Create PDR|Create FAR|N4 Session", re.IGNORECASE),
-        "amf_accept": re.compile(r"(PDU Session Establishment Accept|NAS\spdu.*accept)", re.IGNORECASE),
-    }
-    label_sel = f'namespace="{ns}"'
-    q = f'{{{label_sel}}} |= "PDU Session" or |= "N4" or |= "Nsmf"'
-    if imsi:
-        q = f'{{{label_sel}}} |= "{imsi}"'
-    resp = loki.query_range(query=q, start=start_ns, end=end_ns, limit=10000, direction="BACKWARD")
-    t_amf_req = t_smf = t_upf = t_accept = None
-    for stream in resp.get("data", {}).get("result", []):
+    amf_query = f'{{namespace="{ns}", container="amf"}} |= "PDU Session Establishment Request"'
+    amf_result = loki.query_range(amf_query, start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
+
+    amf_logs = []
+    for stream in amf_result.get("data", {}).get("result", []):
         for ts, line in stream.get("values", []):
-            ts_i = int(ts)
-            if t_amf_req is None and patterns["amf_req"].search(line):
-                t_amf_req = ts_i
-            elif t_smf is None and patterns["smf_sel"].search(line):
-                t_smf = ts_i
-            elif t_upf is None and patterns["upf_rule"].search(line):
-                t_upf = ts_i
-            elif t_accept is None and patterns["amf_accept"].search(line):
-                t_accept = ts_i
-    def ms(ns_i): return (ns_i/1e6) if ns_i else None
-    return {
-        "amf_req_to_smf_ms": ms(t_smf) - ms(t_amf_req) if t_smf and t_amf_req else None,
-        "smf_to_upf_ms": ms(t_upf) - ms(t_smf) if t_upf and t_smf else None,
-        "upf_to_accept_ms": ms(t_accept) - ms(t_upf) if t_accept and t_upf else None,
-        "end_to_end_ms": ms(t_accept) - ms(t_amf_req) if t_accept and t_amf_req else None,
-        "timestamps": {"amf_req": t_amf_req, "smf": t_smf, "upf": t_upf, "accept": t_accept},
-    }
+            amf_logs.append((parse_ts(ts), line.strip()))
+
+    # 2. SMF 로그 조회
+    smf_query = f'{{namespace="{ns}", container="smf"}} |= "triger PDU_SES_EST"'
+    smf_result = loki.query_range(smf_query, start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
+
+    smf_logs = []
+    for stream in smf_result.get("data", {}).get("result", []):
+        for ts, line in stream.get("values", []):
+            smf_logs.append((parse_ts(ts), line.strip()))
+    print(len(smf_logs))
+    # 3. SUPI별 시간 추출
+    t_request = get_amf_request_times(amf_logs)
+    t_accept = get_smf_accept_times(smf_logs)
+
+    # 4. Delay 계산
+    delays = []
+    for supi in t_request:
+        if supi in t_accept:
+            delay_ms = (t_accept[supi] - t_request[supi]).total_seconds() * 1000
+            delays.append((supi, delay_ms))
+
+    # 5. 결과 출력
+    if not delays:
+        print("⚠️ No matching SUPI pairs found for delay calculation.")
+        return 0
+
+    print("📊 PDU Session Setup Delays:")
+    for supi, delay in delays:
+        print(f"  - SUPI {supi}: {delay:.2f} ms")
+
+    avg_delay = sum(d for _, d in delays) / len(delays)
+    print(f"\n📈 Average PDU Session Setup Delay: {avg_delay:.2f} ms")
+    return avg_delay
 
 
 def amf_registration_rate(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai') -> Dict[str, Any]:
@@ -328,10 +340,6 @@ def main():
     end_rfc = to_rfc3339()
     start_rfc = to_rfc3339(datetime.now(timezone.utc) - timedelta(minutes=int(args.window.rstrip("m"))))
 
-    with open ('tmp/ue_num.json') as f:
-        data=json.load(f)
-        ue_num = data['num']
-    ue_threshold = 290
     while True:
         end_ns = now_ns()
         start_ns = now_ns(minutes(-int(args.window.rstrip("m"))))
@@ -354,19 +362,19 @@ def main():
 
         if args.run in ("core", "all"):
             out["core"] = {
-                "pdu_session_delay": pdu_session_delay(loki, ns=args.ns, imsi=None, start_ns=start_ns, end_ns=end_ns),
-                "amf_registration_rate": amf_registration_rate(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
-                "upf_throughput": upf_userplane_throughput(prom, ns=args.ns, upf_pod=args.upf_pod),
-                "smf_session_drop": smf_session_drop_count(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
+                "pdu_session_delay": float(pdu_session_delay(loki, start_ns=start_ns, end_ns=end_ns,)),
+                #"amf_registration_rate": amf_registration_rate(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
+                #"upf_throughput": upf_userplane_throughput(prom, ns=args.ns, upf_pod=args.upf_pod),
+                #"smf_session_drop": smf_session_drop_count(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
             }
-
+        '''
         if args.run in ("app", "all"):
             out["app"] = {
                 "qoe": qoe_from_logs(loki, ns='application', start_ns=start_ns, end_ns=end_ns),
                 "buffer_underrun": buffer_underrun_from_logs(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
                 "cdn_rtt": cdn_rtt_targets(["edge.example.cdn", "edge2.example.cdn"]),
             }
-
+        '''
         print(json.dumps(out, ensure_ascii=False, indent=2))
         abnormal_container = check_core_function_alive()
         abnormality=True if abnormal_container else False
@@ -376,7 +384,11 @@ def main():
                 InDB_write(metric_name, field_name, out[metric_name][field_name], abnormality)
                 if abnormality:
                     InDB_write('failure_history', 'failure_history', abnormal_container)
-        time.sleep(int(args.interval.rstrip("m"))*60)
+        if abnormality:
+            #error occured. rest.
+            time.sleep(int(args.interval.rstrip("m"))*60*5)
+        else:
+            time.sleep(int(args.interval.rstrip("m"))*60)
 
 if __name__ == "__main__":
     main()

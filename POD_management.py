@@ -162,6 +162,12 @@ def check_core_function_alive(window: int=5):
         for word in error_word:
             if word in single_log['log']:
                 is_known_error=False
+                if '[error] SMF Selection, no SMF candidate is available' in single_log['log']:
+                    # SMF failed. need to restart SMF
+                    run_cmd(["kubectl", "rollout", "restart", '-n', 'oai', 'deploy/oai-smf'])
+                    run_cmd(["kubectl", "rollout", "restart", '-n', 'oai', 'deploy/oai-nrf'])
+                    print('SMF error occured. Rolling SMF.')
+                    return 'smf'
                 for known_error in known_error_logs:
                     if known_error in single_log['log']:
                         is_known_error=True
@@ -277,6 +283,7 @@ def exec_in_pod(namespace: str, pod: str, command: str, container: Optional[str]
 def main():
     parser = argparse.ArgumentParser(description="Helm 설치 후 Pod exec 자동화 도구")
     parser.add_argument("--timeout", type=int, default=600, help="Pod Ready 대기 타임아웃(초) 기본 600")
+    parser.add_argument("--soft", action="store_true", help = 'UE making softly')
     # 기타
     parser.add_argument("--log-level", default="INFO", help="로그 레벨 (DEBUG/INFO/WARNING/ERROR)")
 
@@ -305,8 +312,10 @@ def main():
                 json.dump(data,f)
             #wait for little seconds
             time.sleep(40)
-        
-        new_ue_num = random.randrange(-5,10)
+        if args.soft:
+            new_ue_num = random.randrange(-2,5)
+        else:
+            new_ue_num = random.randrange(-5,10)
         if new_ue_num+ue_num<3:
             new_ue_num = 2
         elif new_ue_num+ue_num>ue_threshold:
@@ -321,8 +330,10 @@ def main():
         with open ('tmp/ue_num.json', 'w') as f:
             data = {'num': ue_num}
             json.dump(data,f)
-        time.sleep(random.randrange(10,30))
-
+        if args.soft:
+            time.sleep(random.randrange(30*6,30*8))
+        else:
+            time.sleep(random.randrange(10,30))
 def run_cmd(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     logging.debug("RUN: %s", " ".join(shlex.quote(c) for c in cmd))
     p = subprocess.run(cmd, text=True, capture_output=True)
