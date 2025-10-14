@@ -21,7 +21,7 @@ def to_rfc3339(dt: Optional[datetime] = None) -> str:
         dt = datetime.now(timezone.utc)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc).isoformat()
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def to_epoch(dt: Optional[datetime] = None) -> float:
     """datetime -> epoch seconds (float). dt가 None이면 현재."""
@@ -186,7 +186,24 @@ class PrometheusClient(BaseHttpClient):
         except Exception as e:
             print(f"[active_metrics] Error: {e}")
             return []
+    
+    def pod_list(self, metric_name:str, ns:str) -> List[str]:
+        end = datetime.utcnow()
+        start = end - timedelta(minutes=5)
 
+        params = {
+            "match[]": f'{metric_name}{{namespace="{ns}"}}',
+            "start": start.timestamp(),
+            "end": end.timestamp()
+        }
+
+        res = requests.get(self.http.base_url.rstrip("/") +'/api/v1/series', params=params)
+        res.raise_for_status()
+        #print(res.status_code)
+        #print(res.text[:300])
+        data = res.json()["data"]
+        pods = sorted(set(item.get("pod") for item in data if "pod" in item))
+        return pods
 
     def query(self, promql: str,
               time_: Optional[Union[float, str]] = None,

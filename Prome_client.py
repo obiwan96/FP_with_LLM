@@ -155,7 +155,7 @@ def pdu_session_delay(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai
     for stream in smf_result.get("data", {}).get("result", []):
         for ts, line in stream.get("values", []):
             smf_logs.append((parse_ts(ts), line.strip()))
-    print(len(smf_logs))
+    #print(len(smf_logs))
     # 3. SUPI별 시간 추출
     t_request = get_amf_request_times(amf_logs)
     t_accept = get_smf_accept_times(smf_logs)
@@ -170,23 +170,24 @@ def pdu_session_delay(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai
     # 5. 결과 출력
     if not delays:
         print("⚠️ No matching SUPI pairs found for delay calculation.")
-        return 0
+        return float(0)
 
-    print("📊 PDU Session Setup Delays:")
-    for supi, delay in delays:
-        print(f"  - SUPI {supi}: {delay:.2f} ms")
+    #print("📊 PDU Session Setup Delays:")
+    #for supi, delay in delays:
+    #    print(f"  - SUPI {supi}: {delay:.2f} ms")
 
     avg_delay = sum(d for _, d in delays) / len(delays)
-    print(f"\n📈 Average PDU Session Setup Delay: {avg_delay:.2f} ms")
+    #print(f"\n📈 Average PDU Session Setup Delay: {avg_delay:.2f} ms")
     return avg_delay
 
 
-def amf_registration_rate(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai') -> Dict[str, Any]:
+def amf_registration_rate(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai') -> float:
     """
     AMF 로그에서 Registration 성공/실패 카운트.
     예시 키워드: "Registration accept", "Registration reject"
     """
-    resp = loki.query_range(query=f'{{namespace="{ns}", app="oai-amf"}} |= "Registration"', start=start_ns, end=end_ns, limit=10000, direction="BACKWARD")
+    amf_query=  f'{{namespace="{ns}", container="amf"}} |= "Registration" != "De-registration"'     # De-registration 제외
+    resp = loki.query_range(amf_query, start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
     ok = fail = 0
     for stream in resp.get("data", {}).get("result", []):
         for ts, line in stream.get("values", []):
@@ -196,47 +197,55 @@ def amf_registration_rate(loki: LokiClient, start_ns: int, end_ns: int, ns: str=
             elif "reject" in low or "failure" in low:
                 fail += 1
     total = ok + fail
-    rate = (ok / total) if total else None
-    return {"ok": ok, "fail": fail, "rate": rate}
+    rate = (ok / total) if total else 0
+    return float(rate)
 
-
-def upf_userplane_throughput(prom: PrometheusClient, upf_pod: Optional[str],
-                             ns: str='oai',
+def upf_userplane_throughput(prom: PrometheusClient, 
+                             start_rfc:str, end_rfc:str,
+                             ns: str='oai', upf_pod: Optional[str]=None,
                              metric_tx: str = 'container_network_transmit_bytes_total',
                              metric_rx: str = 'container_network_receive_bytes_total',
-                             step: str = "30s", window: str = "5m") -> Dict[str, Any]:
+                             step:str ='30s', window:str = '5m'
+                             ) -> Dict[str, Any]:
     """
     UPF Pod 네트워크 인터페이스 기준의 전송량을 PromQL로 계산.
     환경에 맞춰 VPP/gtp5g exporter가 있으면 그 지표명을 사용.
     """
-    sel = f'{{namespace="{ns}"' + (f', pod="{upf_pod}"' if upf_pod else "") + "}}"
-    promql_tx = f'rate({metric_tx}{sel}[{window}])'
-    promql_rx = f'rate({metric_rx}{sel}[{window}])'
-    end = to_rfc3339()
-    start = to_rfc3339(datetime.now(timezone.utc) - timedelta(minutes=15))
-    r_tx = prom.query_range(promql_tx, start=start, end=end, step=step)
-    r_rx = prom.query_range(promql_rx, start=start, end=end, step=step)
+    sel = f'{{namespace="{ns}", pod=~"oai-upf.*"}}'
+    promql_tx = f'increase({metric_tx}{sel}[{window}])'
+    promql_rx = f'increase({metric_rx}{sel}[{window}])'
+    #print(promql_tx)
+    r_tx = prom.query_range(promql_tx, start=start_rfc, end=end_rfc, step=step)
+    r_rx = prom.query_range(promql_rx, start=start_rfc, end=end_rfc, step=step)
+    #print(r_tx)
     def last_avg(resp):
-        vals = []
-        for it in resp.get("data", {}).get("result", []):
-            series_vals = [float(v) for ts, v in it.get("values", []) if v not in ("NaN", "Inf")]
-            if series_vals:
-                vals.append(sum(series_vals)/len(series_vals))
-        return sum(vals)/len(vals) if vals else 0.0
-    return {"tx_bps": last_avg(r_tx), "rx_bps": last_avg(r_rx)}
+        total = 0.0
+        for it in resp["data"]["result"]:
+            values = it.get("values", [])
+            if not values:
+                continue
+            # 마지막 시점의 increase 값
+            last_val = float(values[-1][1]) if values[-1][1] not in ("NaN", "Inf") else 0.0
+            #print(last_val)
+            total += last_val
+        return total
+    total_tx=last_avg(r_tx)
+    total_rx= last_avg(r_rx)
+    return float(total_tx/total_rx)
 
 
 def smf_session_drop_count(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai') -> Dict[str, Any]:
     """
-    SMF 제어 로그에서 세션 drop/release 판단. 키워드 조정 필요.
+    SMF 제어 로그에서 세션 drop 판단. 다만, 아직 관측된 적은 없음.
     """
-    resp = loki.query_range(query=f'{{namespace="{ns}", app="oai-smf"}} |= "Session" ', start=start_ns, end=end_ns, limit=10000, direction="BACKWARD")
+    resp = loki.query_range(query=f'{{namespace="{ns}", app="oai-smf"}} |= "Session" ', 
+                            start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
     drops = 0
     for stream in resp.get("data", {}).get("result", []):
         for ts, line in stream.get("values", []):
-            if "drop" in line.lower() or "release" in line.lower():
+            if "drop" in line.lower() :
                 drops += 1
-    return {"smf_session_drop": drops}
+    return drops
 
 # ============ APPLICATION / SERVICE =================
 # Need to implement measurement method in application#
@@ -337,13 +346,12 @@ def main():
     prom = PrometheusClient(args.prom)
     loki = LokiClient(args.loki)
 
-    end_rfc = to_rfc3339()
-    start_rfc = to_rfc3339(datetime.now(timezone.utc) - timedelta(minutes=int(args.window.rstrip("m"))))
 
     while True:
         end_ns = now_ns()
         start_ns = now_ns(minutes(-int(args.window.rstrip("m"))))
-
+        end_rfc = to_rfc3339()
+        start_rfc = to_rfc3339(datetime.now(timezone.utc) - timedelta(minutes=int(args.window.rstrip("m"))))
         out: Dict[str, Any] = {}
 
         rrc_count = 0
@@ -363,9 +371,9 @@ def main():
         if args.run in ("core", "all"):
             out["core"] = {
                 "pdu_session_delay": float(pdu_session_delay(loki, start_ns=start_ns, end_ns=end_ns,)),
-                #"amf_registration_rate": amf_registration_rate(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
-                #"upf_throughput": upf_userplane_throughput(prom, ns=args.ns, upf_pod=args.upf_pod),
-                #"smf_session_drop": smf_session_drop_count(loki, ns=args.ns, start_ns=start_ns, end_ns=end_ns),
+                "amf_registration_rate": amf_registration_rate(loki, start_ns=start_ns, end_ns=end_ns),
+                "upf_throughput": upf_userplane_throughput(prom, start_rfc=start_rfc, end_rfc=end_rfc),
+                "smf_session_drop": int(smf_session_drop_count(loki, start_ns=start_ns, end_ns=end_ns)),
             }
         '''
         if args.run in ("app", "all"):
