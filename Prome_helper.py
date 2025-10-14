@@ -254,9 +254,14 @@ class LokiClient:
 
         logs = []
         for stream in result.get("data", {}).get("result", []):
+            container = stream.get("stream", {}).get("container", "unknown")
             for ts, log in stream.get("values", []):
                 log_time = datetime.fromtimestamp(int(ts) / 1e9)
-                logs.append((log_time, log.strip()))
+                logs.append({
+                    "timestamp": log_time,
+                    "container": container,
+                    "log": log.strip()
+                })
         return logs
 
 # ------------------------------

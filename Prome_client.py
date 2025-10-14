@@ -315,7 +315,7 @@ def main():
     ap.add_argument("--ns", default='oai', help="Kubernetes namespace (e.g., oai)")
     ap.add_argument("--upf_pod", help="UPF pod name label value (optional)")
     ap.add_argument("--iface", default="eth0", help="Interface for tc stats")
-    ap.add_argument("--window", default="5m", help="Lookback window (e.g., 15m)")
+    ap.add_argument("--window", default="5m", help="Lookback window (e.g., 5m)")
     ap.add_argument("--interval", default="1m", help="Data collection interval (e.g., 1m)")
     ap.add_argument("--step", default="30s", help="Prometheus step")
     ap.add_argument("--run", default="all", help="What to run: ran,transport,core,app,all")
@@ -368,26 +368,14 @@ def main():
             }
 
         print(json.dumps(out, ensure_ascii=False, indent=2))
-        abnormality = check_core_function_alive()
+        abnormal_container = check_core_function_alive()
+        abnormality=True if abnormal_container else False
+
         for metric_name in out.keys():
             for field_name in out[metric_name]:
-                InDB_write(metric_name, field_name, abnormality)
-        new_ue_num = random.randrange(-5,8)
-        if new_ue_num+ue_num<0:
-            new_ue_num = 2
-        elif new_ue_num+ue_num>ue_threshold:
-            new_ue_num = -20
-        if new_ue_num>0:
-            for i in range(ue_num+1, ue_num+new_ue_num+1):
-                helm_ue_install(i)
-        elif new_ue_num<0:
-            for i in range(ue_num+new_ue_num+1, ue_num+1):
-                helm_ue_uninstall(i)
-        ue_num += new_ue_num
-        print(f'now we have {ue_num} nums of UEs')
-        with open ('tmp/ue_num.json', 'w') as f:
-            data = {'num': ue_num}
-            json.dump(data,f)
+                InDB_write(metric_name, field_name, out[metric_name][field_name], abnormality)
+                if abnormality:
+                    InDB_write('failure_history', 'failure_history', abnormal_container)
         time.sleep(int(args.interval.rstrip("m"))*60)
 
 if __name__ == "__main__":

@@ -42,7 +42,9 @@ from kubernetes.stream import stream
 from kubernetes import client, config
 from kubernetes.stream import stream
 from Prome_helper import *
-from secret import loki_ip
+from secret import loki_ip, error_alert_info
+import requests
+import random
 
 helm_repo_path='ueransim-ue-k6'
 # ------------------------------
@@ -103,6 +105,14 @@ def helm_ue_install(ue_num:int):
 def helm_ue_uninstall(ue_num:int):
     cmd = ["helm", "uninstall", f"ueransim-ue{ue_num}", "-n", "ue"]
     run_cmd(cmd)
+    #print(f'Deleted {ue_num}-ue.')
+
+def helm_ue_uninstall_multiple(last_ue_num:int, start_num:int=1):
+    if last_ue_num < start_num:
+        print('last_ue_num must be bigger than start_num!')
+        return
+    for i in range(start_num,last_ue_num+1):
+        helm_ue_uninstall(i)
 
 def helm_repo_add_and_update(repo_name: Optional[str], repo_url: Optional[str]):
     """필요 시 helm repo add & helm repo update 실행"""
@@ -144,11 +154,23 @@ def check_core_function_alive(window: int=5):
     loki = LokiClient(loki_ip)
     recent_logs = loki.get_recent_logs('oai', window=window)
     error_word = ['[error]', '[critical]', '[fatal]']
+
+    with open('tmp/known_error.txt') as f:
+        data = f.read()
+    known_error_logs = data.split('\n')    
     for single_log in recent_logs:
         for word in error_word:
-            if word in single_log[1]:
-                print(f'error occured! :{single_log}')
-                return True
+            if word in single_log['log']:
+                is_known_error=False
+                for known_error in known_error_logs:
+                    if known_error in single_log['log']:
+                        is_known_error=True
+                        break
+                if not is_known_error:
+                    print(f"error occured in {single_log['container']}! :{single_log['log']}")
+                    # Send telegram message to me if error occur!
+                    requests.post(error_alert_info['url'], json=error_alert_info['body'],headers=error_alert_info['headers'])
+                    return single_log['container']
     return False
 
 # ------------------------------
@@ -254,21 +276,6 @@ def exec_in_pod(namespace: str, pod: str, command: str, container: Optional[str]
 # ------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Helm 설치 후 Pod exec 자동화 도구")
-    # Kube
-    parser.add_argument("--context", help="kubectl 컨텍스트 이름 (옵션)")
-    parser.add_argument("--namespace", "-n", required=True, help="대상 네임스페이스")
-    # Helm
-    parser.add_argument("--repo-name", help="helm repo 이름 (예: grafana)")
-    parser.add_argument("--repo-url", help="helm repo URL (예: https://grafana.github.io/helm-charts)")
-    parser.add_argument("--chart", required=True, help="차트 식별자 (예: grafana/grafana) 또는 로컬 경로")
-    parser.add_argument("--release", required=True, help="릴리스 이름 (예: grafana)")
-    parser.add_argument("--version", help="차트 버전 (옵션)")
-    parser.add_argument("--values", "-f", action="append", default=[], help="values 파일 경로(다중 지정 가능)")
-    parser.add_argument("--set", dest="set_kvs", action="append", default=[], help="--set key=value (다중 지정)")
-    # Pod 선택 & Exec
-    parser.add_argument("--selector", help="Pod 라벨 셀렉터 (기본: app.kubernetes.io/instance=<release>)")
-    parser.add_argument("--container", help="exec 대상 컨테이너 이름 (옵션)")
-    parser.add_argument("--command", required=True, help="Pod 내부에서 실행할 명령 (예: \"sh -lc 'ls -al /'\")")
     parser.add_argument("--timeout", type=int, default=600, help="Pod Ready 대기 타임아웃(초) 기본 600")
     # 기타
     parser.add_argument("--log-level", default="INFO", help="로그 레벨 (DEBUG/INFO/WARNING/ERROR)")
@@ -276,37 +283,45 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 
-    selector = args.selector or f"app.kubernetes.io/instance={args.release}"
-
-    # 1) Helm repo 처리
-    helm_repo_add_and_update(args.repo_name, args.repo_url)
-
-    # 2) Helm upgrade --install
-    helm_upgrade_install(
-        release=args.release,
-        chart=args.chart,
-        namespace=args.namespace,
-        values_files=args.values,
-        set_kvs=args.set_kvs,
-        version=args.version,
-        create_namespace=True,
-    )
-
-    # 3) kubeconfig 로드
-    load_kube_config(context=args.context)
-
-    # 4) Pod Ready 대기
-    ready_pods = wait_for_pods_ready(args.namespace, selector, timeout=args.timeout)
-    if not ready_pods:
-        logging.error("Ready Pod가 없습니다. 종료합니다.")
-        sys.exit(2)
-
-    # 5) 첫 번째 Ready Pod에 exec (필요 시 전략 변경 가능)
-    target_pod = ready_pods[0]
-    logging.info("exec 대상 Pod: %s", target_pod)
-
-    rc = exec_in_pod(args.namespace, target_pod, args.command, container=args.container, tty=False)
-    sys.exit(rc)
+    # If use this file as main, 
+    # It will randomly create or delete UEs
+    with open ('tmp/ue_num.json') as f:
+        data=json.load(f)
+        ue_num = data['num']
+    
+    # In AMF, IMSI is registered only for 225 UEs.
+    # But, in my case, the node can only run only 57 UEs.
+    ue_threshold=60 
+    while True:
+        if random.randrange(1,4)==1:
+            # Randomly delete 1/3 of UEs
+            delete_num=int(ue_num/3)
+            if ue_num-delete_num<4:
+                continue
+            helm_ue_uninstall_multiple(last_ue_num=ue_num, start_num=ue_num-delete_num)
+            ue_num = ue_num-delete_num-1
+            with open ('tmp/ue_num.json', 'w') as f:
+                data = {'num': ue_num}
+                json.dump(data,f)
+            #wait for little seconds
+            time.sleep(40)
+        
+        new_ue_num = random.randrange(-5,10)
+        if new_ue_num+ue_num<3:
+            new_ue_num = 2
+        elif new_ue_num+ue_num>ue_threshold:
+            new_ue_num = -20
+        if new_ue_num>0:
+            for i in range(ue_num+1, ue_num+new_ue_num+1):
+                helm_ue_install(i)
+        elif new_ue_num<0:
+            helm_ue_uninstall_multiple(last_ue_num=ue_num, start_num=ue_num+new_ue_num+1)
+        ue_num += new_ue_num
+        print(f'now we have {ue_num} nums of UEs')
+        with open ('tmp/ue_num.json', 'w') as f:
+            data = {'num': ue_num}
+            json.dump(data,f)
+        time.sleep(random.randrange(10,30))
 
 def run_cmd(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     logging.debug("RUN: %s", " ".join(shlex.quote(c) for c in cmd))
