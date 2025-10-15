@@ -383,7 +383,7 @@ def main():
                 "cdn_rtt": cdn_rtt_targets(["edge.example.cdn", "edge2.example.cdn"]),
             }
         '''
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        #print(json.dumps(out, ensure_ascii=False, indent=2))
         abnormal_container = check_core_function_alive()
         abnormality=True if abnormal_container else False
 
