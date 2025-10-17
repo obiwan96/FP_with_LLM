@@ -140,7 +140,7 @@ def pdu_session_delay(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai
     AMF/SMF/UPF 각 로그에서 동일 세션(IMSI/SUPI/SessionID)의 주요 이벤트 타임스탬프 간 차이를 계산.
     """
     amf_query = f'{{namespace="{ns}", container="amf"}} |= "PDU Session Establishment Request"'
-    amf_result = loki.query_range(amf_query, start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
+    amf_result = loki.query_range(amf_query, start=start_ns, end=end_ns, limit=1000, direction="BACKWARD")
 
     amf_logs = []
     for stream in amf_result.get("data", {}).get("result", []):
@@ -149,7 +149,7 @@ def pdu_session_delay(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai
 
     # 2. SMF 로그 조회
     smf_query = f'{{namespace="{ns}", container="smf"}} |= "triger PDU_SES_EST"'
-    smf_result = loki.query_range(smf_query, start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
+    smf_result = loki.query_range(smf_query, start=start_ns, end=end_ns, limit=1000, direction="BACKWARD")
 
     smf_logs = []
     for stream in smf_result.get("data", {}).get("result", []):
@@ -165,7 +165,9 @@ def pdu_session_delay(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai
     for supi in t_request:
         if supi in t_accept:
             delay_ms = (t_accept[supi] - t_request[supi]).total_seconds() * 1000
-            delays.append((supi, delay_ms))
+            if delay_ms >=0:
+                # if delay is less than 0, matching is wrong
+                delays.append((supi, delay_ms))
 
     # 5. 결과 출력
     if not delays:
@@ -187,7 +189,7 @@ def amf_registration_rate(loki: LokiClient, start_ns: int, end_ns: int, ns: str=
     예시 키워드: "Registration accept", "Registration reject"
     """
     amf_query=  f'{{namespace="{ns}", container="amf"}} |= "Registration" != "De-registration"'     # De-registration 제외
-    resp = loki.query_range(amf_query, start=start_ns, end=end_ns, limit=5000, direction="BACKWARD")
+    resp = loki.query_range(amf_query, start=start_ns, end=end_ns, limit=1000, direction="BACKWARD")
     ok = fail = 0
     for stream in resp.get("data", {}).get("result", []):
         for ts, line in stream.get("values", []):

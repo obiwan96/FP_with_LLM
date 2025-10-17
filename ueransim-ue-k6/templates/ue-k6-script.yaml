@@ -11,10 +11,10 @@ data:
       scenarios: {
         web: {
           executor: 'constant-arrival-rate',
-          rate: 50,              // 초당 요청 수 (먼저 50부터, 점진 상승)
+          rate: 100,              // 초당 요청 수 (먼저 50부터, 점진 상승)
           timeUnit: '1s',
           duration: '10m',
-          preAllocatedVUs: 50,
+          preAllocatedVUs: 70,
           maxVUs: 100,
         },
       },

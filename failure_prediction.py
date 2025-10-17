@@ -14,6 +14,7 @@ from secret import InDB_info, prometheus_ip
 import joblib
 from sklearn.metrics import f1_score
 from sklearn.utils import resample
+import random
 warnings.filterwarnings("ignore")
 
 ''' Usuage
@@ -91,7 +92,7 @@ class TCNModel(nn.Module):
         return self.fc(out[:, -1, :])
 
 # ---------- 데이터 로드 ----------
-def get_prom_metric(prom, metric_name, start, end, step="30s", ns="oai", granularity="pod_avg"):
+def get_prom_metric(prom, metric_name, start, end, step="1m", ns="oai", granularity="pod_avg"):
     query = f'{metric_name}{{namespace="{ns}"}}'
     data = prom.query_range(query, start=start, end=end, step=step)['data']['result']
     dfs = []
@@ -139,12 +140,35 @@ def get_influx_metrics(influx, start, end, bucket='mdaf'):
     df = df.reset_index()
     return df
 
-def get_failure_history(influx, start, end, bucket='mdaf'):
+def get_failure_and_recovery(influx, start, end, bucket="mdaf"):
+    """
+    Influx에서 failure_history와 recovery_history를 모두 읽어 반환.
+    """
+    query = f'''
+    from(bucket: "{bucket}")
+      |> range(start: {start}, stop: {end})
+      |> filter(fn: (r) => r["_measurement"] == "failure_history")
+      |> filter(fn: (r) => r["_field"] == "failure_history" or r["_field"] == "recovery_history")
+      |> filter(fn: (r) => r["_value"] != "slo violation")
+      |> keep(columns: ["_time", "_field", "_value"])
+    '''
+    tables = influx.query_api().query_data_frame(query)
+    if tables.empty:
+        print("[WARN] No failure/recovery data found.")
+        return pd.DataFrame(columns=["timestamp", "type"])
+
+    df = tables[["_time", "_field", "_value"]].rename(columns={"_time": "timestamp", "_field": "type", "_value": "label"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+    df["type"] = df["type"].replace({"failure_history": "failure", "recovery_history": "recovery"})
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+def get_slo_violation_history(influx, start, end, bucket='mdaf'):
     query = f'''
     from(bucket: "{bucket}")
       |> range(start: {start}, stop: {end})
       |> filter(fn: (r) => r["_measurement"] == "failure_history")
       |> filter(fn: (r) => r["_field"] == "failure_history")
+      |> filter(fn: (r) => r["_value"] == "slo violation")
       |> keep(columns: ["_time", "_value"])
     '''
     tables = influx.query_api().query_data_frame(query)
@@ -180,7 +204,7 @@ def main(args):
     end = to_rfc3339()
     start = to_rfc3339(datetime.fromisoformat(args.start.replace("Z", "+00:00")))
     
-    prom_df = [get_prom_metric(prom, m, start, end, granularity=args.granularity).sort_values("timestamp") for m in metrics.values()]
+    prom_df = [get_prom_metric(prom, m, start, end, step= args.step, granularity=args.granularity).sort_values("timestamp") for m in metrics.values()]
     merged = prom_df[0]
     for df in prom_df[1:]:
         merged = pd.merge_asof(merged.sort_values("timestamp"), df.sort_values("timestamp"), on="timestamp", direction="nearest")
@@ -193,12 +217,69 @@ def main(args):
     merged = pd.merge_asof(merged, influx_df, on="timestamp", direction="nearest", tolerance=pd.Timedelta("30s"))
     print(f'input data shape: {merged.shape}')
 
-    failure_df = get_failure_history(influx, args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
+    merged["timestamp"] = pd.to_datetime(merged["timestamp"]).dt.tz_localize(None)
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
+
+    # === 고장/회복 데이터 읽기 ===
+    events_df = get_failure_and_recovery(influx, start, end)
+
+    # === failure-recovery 구간 식별 ===
+    failures = events_df[events_df["type"] == "failure"]["timestamp"].tolist()
+    recoveries = events_df[events_df["type"] == "recovery"]["timestamp"].tolist()
+
+    # recovery가 없을 경우 대비
+    if not failures:
+        print("[INFO] No failure events found.")
+    elif not recoveries:
+        print("[WARN] No recovery events found. Keeping all data post-failure.")
+
+    drop_ranges = []
+    for f_time in failures:
+        # f_time 이후의 가장 가까운 recovery_time 찾기
+        rec_after = [r for r in recoveries if r > f_time]
+        if rec_after:
+            r_time = min(rec_after)
+        else:
+            # recovery가 없는 마지막 고장은 데이터 끝까지 제거
+            r_time = merged["timestamp"].max()
+        drop_ranges.append((f_time, r_time))
+
+    print("[INFO] Excluding failure→recovery intervals:")
+    for f, r in drop_ranges:
+        print(f"  {f}  →  {r}")
+
+    # === merged에서 해당 구간 제거 ===
+    mask = pd.Series(False, index=merged.index)
+    for f, r in drop_ranges:
+        mask |= (merged["timestamp"] >= f) & (merged["timestamp"] <= r)
+
+    before = len(merged)
+    merged = merged.loc[~mask].reset_index(drop=True)
+    after = len(merged)
+    print(f"[INFO] Removed {before - after} rows between failure→recovery intervals.")
+
+    # === 이후 failure label 태깅 (회복된 이후 데이터만 포함) ===
+    failure_df = pd.DataFrame({"timestamp": failures})
+    failure_df["label"] = 1
+    merged = pd.merge_asof(
+        merged,
+        failure_df,
+        on="timestamp",
+        direction="forward",
+        tolerance=pd.Timedelta("1m")
+    )
+    failure_df = get_slo_violation_history(influx, args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
     failure_df["timestamp"] = pd.to_datetime(failure_df["timestamp"]).dt.tz_localize(None)
     #print(failure_df)
     # Label 병합
     merged = pd.merge_asof(merged, failure_df, on="timestamp", direction="forward",tolerance=pd.Timedelta("1m"))
-    merged["label"].fillna(0, inplace=True)
+    merged["label"] = (
+        merged.get("label_x", 0).fillna(0).astype(int) |
+        merged.get("label_y", 0).fillna(0).astype(int)
+    )
+
+    merged.drop(columns=[col for col in ["label_x", "label_y"] if col in merged.columns], inplace=True)
+
     print (f'Total abnormal row num: {(merged["label"] == 1).sum()}')
     
     # feature transform
@@ -223,9 +304,11 @@ def main(args):
     X_seq, y_seq = make_dataset(X, y, args.window, args.horizon)
 
     split = int(len(X_seq) * args.train_ratio)
-    X_train, y_train = X_seq[:split], y_seq[:split]
-    X_test, y_test = X_seq[split:], y_seq[split:]
-
+    split_bound = random.randrange(0,split)
+    test_num= len(X_seq)-split
+    X_train, y_train = np.append(X_seq[:split_bound],X_seq[split_bound+test_num:],axis=0), np.append(y_seq[:split_bound],y_seq[split_bound+test_num:],axis=0)
+    X_test, y_test = X_seq[split_bound:split_bound+test_num], y_seq[split_bound:split_bound+test_num]
+    assert(len(X_train)+len(X_test)==len(X_seq))
     # Oversampling
     normal_idx = np.where(y_train == 0)[0]
     abnormal_idx = np.where(y_train == 1)[0]
@@ -306,10 +389,10 @@ def main(args):
             print(f"[Epoch {epoch+1:02d}] Loss={epoch_loss/len(train_loader):.4f}, F1={train_f1:.4f}")
 
             print("[INFO] Saving SHAP-related resources...")
-            torch.save(model.state_dict(), f"tmp/models/{args.model}_model_{int(train_f1*100)}.pt")               # 학습된 가중치
-            joblib.dump(scaler, f"tmp/models/{args.model}_{int(train_f1*100)}_scaler.joblib")                     # normalization 객체
+            torch.save(model.state_dict(), f"tmp/models/{args.model}_model_win{args.window}_hor{args.horizon}_{int(train_f1*100)}.pt")               # 학습된 가중치
+            joblib.dump(scaler, f"tmp/models/{args.model}_win{args.window}_hor{args.horizon}_{int(train_f1*100)}_scaler.joblib")                     # normalization 객체
             pd.Series(feature_names).to_csv("feature_names.csv", index=False)  # feature 이름
-            np.save(f"tmp/models/{args.model}_{int(train_f1*100)}_bg_samples.npy", X_train_bal[:512])             # 학습셋 일부 (SHAP background)
+            np.save(f"tmp/models/{args.model}_win{args.window}_hor{args.horizon}_{int(train_f1*100)}_bg_samples.npy", X_train_bal[:512])             # 학습셋 일부 (SHAP background)
             #print("[INFO] Saved: model.pt, scaler.joblib, feature_names.csv, bg_samples.npy")
 
     # evaluation
@@ -324,20 +407,20 @@ def main(args):
 
     print("\n[RESULT] Classification Report:")    
     print(f"\n[FINAL TEST] F1-score = {test_f1:.4f}")
-    print(1)
     print(classification_report(trues, preds, digits=3))
-    print(2)
+    print(f"Model saved in 'tmp/models/{args.model}_model_win{args.window}_hor{args.horizon}_{int(train_f1*100)}.pt'.")
     del model, optimizer
     torch.cuda.empty_cache()
     gc.collect()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start", type=str, default="2025-10-14T15:00:00Z")
+    parser.add_argument("--start", type=str, default="2025-10-14T04:00:00Z")
     parser.add_argument("--window", type=int, default=10)
     parser.add_argument("--horizon", type=int, default=5)
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--step", type=str, default='1m', help="step for Prometheus, e.g. 1m, 30s")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--granularity", type=str, choices=["pod", "node", "pod_avg"], default="pod_avg")

@@ -315,7 +315,7 @@ def main():
         if args.soft:
             new_ue_num = random.randrange(-2,5)
         else:
-            new_ue_num = random.randrange(-5,10)
+            new_ue_num = random.randrange(-8,15)
         if new_ue_num+ue_num<3:
             new_ue_num = 2
         elif new_ue_num+ue_num>ue_threshold:
@@ -333,7 +333,7 @@ def main():
         if args.soft:
             time.sleep(random.randrange(30*6,30*8))
         else:
-            time.sleep(random.randrange(10,30))
+            time.sleep(random.randrange(5,20))
 def run_cmd(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     logging.debug("RUN: %s", " ".join(shlex.quote(c) for c in cmd))
     p = subprocess.run(cmd, text=True, capture_output=True)

@@ -270,8 +270,13 @@ class LokiClient:
             "limit": limit,
             "direction": direction,
         }
-        response = requests.get(f"{self.base_url}/loki/api/v1/query_range", params=params)
-        response.raise_for_status()
+        try:
+            response = requests.get(f"{self.base_url}/loki/api/v1/query_range", params=params)
+            response.raise_for_status()
+        except:
+            #loki busy..
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: Loki doesn't response. Please check!")
+            return {'data':{"result":[]}}
         return response.json()
 
     def get_containers_recently_logged(self, namespace: str):

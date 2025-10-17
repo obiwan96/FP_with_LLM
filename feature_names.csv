@@ -1,8 +1,7 @@
 0
-container_cpu_usage_seconds_total_oai-smf-9d9596c8b-tbq8m
-container_memory_usage_bytes_oai-smf-9d9596c8b-tbq8m
-container_network_transmit_bytes_total_oai-smf-9d9596c8b-tbq8m
-amf_registration_rate
-pdu_session_delay
+container_cpu_usage_seconds_total_5gc-mysql-5d84db7f84-gjwvt
+container_memory_usage_bytes_5gc-mysql-5d84db7f84-gjwvt
+container_network_transmit_bytes_total_5gc-mysql-5d84db7f84-gjwvt
+container_fs_writes_bytes_total_5gc-mysql-5d84db7f84-gjwvt
 rrc_state_counts
 upf_throughput
