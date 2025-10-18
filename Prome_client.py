@@ -348,7 +348,7 @@ def main():
     prom = PrometheusClient(args.prom)
     loki = LokiClient(args.loki)
 
-
+    known_error_occured_list = []
     while True:
         end_ns = now_ns()
         start_ns = now_ns(minutes(-int(args.window.rstrip("m"))))
@@ -386,9 +386,14 @@ def main():
             }
         '''
         #print(json.dumps(out, ensure_ascii=False, indent=2))
-        abnormal_container = check_core_function_alive()
-        abnormality=True if abnormal_container else False
-
+        abnormality, abnormal_container = check_core_function_alive()
+        if abnormality and not abnormal_container:
+            abnormality = False
+            known_error_occured_list.append(datetime.now())
+        out['error_occured'] = {'num' : len(known_error_occured_list)}
+        for error_time in known_error_occured_list:
+            if (datetime.now() - error_time).total_seconds() > int(args.window.rstrip("m")) * 60:
+                known_error_occured_list.remove(error_time)
         for metric_name in out.keys():
             for field_name in out[metric_name]:
                 InDB_write(metric_name, field_name, out[metric_name][field_name], abnormality)

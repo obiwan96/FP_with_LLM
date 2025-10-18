@@ -301,7 +301,7 @@ def main(args):
     X = scaler.fit_transform(feats)
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
     y = merged["label"].values
-    X_seq, y_seq = make_dataset(X, y, args.window, args.horizon)
+    X_seq, y_seq = make_dataset(X, y, args.win, args.hor)
 
     split = int(len(X_seq) * args.train_ratio)
     split_bound = random.randrange(0,split)
@@ -389,10 +389,10 @@ def main(args):
             print(f"[Epoch {epoch+1:02d}] Loss={epoch_loss/len(train_loader):.4f}, F1={train_f1:.4f}")
 
             print("[INFO] Saving SHAP-related resources...")
-            torch.save(model.state_dict(), f"tmp/models/{args.model}_model_win{args.window}_hor{args.horizon}_{int(train_f1*100)}.pt")               # 학습된 가중치
-            joblib.dump(scaler, f"tmp/models/{args.model}_win{args.window}_hor{args.horizon}_{int(train_f1*100)}_scaler.joblib")                     # normalization 객체
+            torch.save(model.state_dict(), f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(train_f1*100)}.pt")               # 학습된 가중치
+            joblib.dump(scaler, f"tmp/models/{args.model}_win{args.win}_hor{args.hor}_{int(train_f1*100)}_scaler.joblib")                     # normalization 객체
             pd.Series(feature_names).to_csv("feature_names.csv", index=False)  # feature 이름
-            np.save(f"tmp/models/{args.model}_win{args.window}_hor{args.horizon}_{int(train_f1*100)}_bg_samples.npy", X_train_bal[:512])             # 학습셋 일부 (SHAP background)
+            np.save(f"tmp/models/{args.model}_win{args.win}_hor{args.hor}_{int(train_f1*100)}_bg_samples.npy", X_train_bal[:512])             # 학습셋 일부 (SHAP background)
             #print("[INFO] Saved: model.pt, scaler.joblib, feature_names.csv, bg_samples.npy")
 
     # evaluation
@@ -408,16 +408,16 @@ def main(args):
     print("\n[RESULT] Classification Report:")    
     print(f"\n[FINAL TEST] F1-score = {test_f1:.4f}")
     print(classification_report(trues, preds, digits=3))
-    print(f"Model saved in 'tmp/models/{args.model}_model_win{args.window}_hor{args.horizon}_{int(train_f1*100)}.pt'.")
+    print(f"Model saved in 'tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(train_f1*100)}.pt'.")
     del model, optimizer
     torch.cuda.empty_cache()
     gc.collect()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start", type=str, default="2025-10-14T04:00:00Z")
-    parser.add_argument("--window", type=int, default=10)
-    parser.add_argument("--horizon", type=int, default=5)
+    parser.add_argument("--start", type=str, default="2025-10-14T10:00:00Z")
+    parser.add_argument("--win", type=int, default=10)
+    parser.add_argument("--hor", type=int, default=5)
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument("--step", type=str, default='1m', help="step for Prometheus, e.g. 1m, 30s")

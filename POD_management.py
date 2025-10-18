@@ -167,17 +167,18 @@ def check_core_function_alive(window: int=5):
                     run_cmd(["kubectl", "rollout", "restart", '-n', 'oai', 'deploy/oai-smf'])
                     run_cmd(["kubectl", "rollout", "restart", '-n', 'oai', 'deploy/oai-nrf'])
                     print('SMF error occured. Rolling SMF.')
-                    return 'smf'
+                    return True, 'smf'
                 for known_error in known_error_logs:
                     if known_error in single_log['log']:
                         is_known_error=True
-                        break
+                        print (f'Known error occured in {single_log["container"]}! :{known_error}')
+                        return True, False # Known error trigger
                 if not is_known_error:
                     print(f"error occured in {single_log['container']}! :{single_log['log']}")
                     # Send telegram message to me if error occur!
                     requests.post(error_alert_info['url'], json=error_alert_info['body'],headers=error_alert_info['headers'])
-                    return single_log['container']
-    return False
+                    return True, single_log['container']
+    return False, None
 
 # ------------------------------
 # K8s Pod 대기 & Exec
@@ -315,7 +316,7 @@ def main():
         if args.soft:
             new_ue_num = random.randrange(-2,5)
         else:
-            new_ue_num = random.randrange(-8,15)
+            new_ue_num = random.randrange(-10,20)
         if new_ue_num+ue_num<3:
             new_ue_num = 2
         elif new_ue_num+ue_num>ue_threshold:
@@ -333,7 +334,8 @@ def main():
         if args.soft:
             time.sleep(random.randrange(30*6,30*8))
         else:
-            time.sleep(random.randrange(5,20))
+            time.sleep(random.randrange(5,15))
+
 def run_cmd(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     logging.debug("RUN: %s", " ".join(shlex.quote(c) for c in cmd))
     p = subprocess.run(cmd, text=True, capture_output=True)
