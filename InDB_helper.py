@@ -94,7 +94,7 @@ if __name__ == '__main__':
     args= ap.parse_args()
     if args.time:
         # Korean time!
-        data_time=datetime.fromisoformat(args.start.replace("Z", "+09:00"))
+        data_time=datetime.fromisoformat(args.time.replace("Z", "+09:00"))
     else: 
-        date_time= datetime.now(timezone.utc)
-    
+        data_time= datetime.now(timezone.utc)
+    InDB_write_recovery_timestamp(data_time)

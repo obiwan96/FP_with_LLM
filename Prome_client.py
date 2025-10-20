@@ -349,6 +349,8 @@ def main():
     loki = LokiClient(args.loki)
 
     known_error_occured_list = []
+    wait_count=0
+    load_kube_config()
     while True:
         end_ns = now_ns()
         start_ns = now_ns(minutes(-int(args.window.rstrip("m"))))
@@ -402,8 +404,19 @@ def main():
         if abnormality:
             #error occured. rest.
             time.sleep(int(args.interval.rstrip("m"))*60*5)
+            wait_count+=int(args.interval.rstrip("m"))*60*5
         else:
             time.sleep(int(args.interval.rstrip("m"))*60)
-
+            wait_count+=int(args.interval.rstrip("m"))*60
+        if wait_count > 60*5:
+            # Reload fault-detector pod to check new UE registration works well
+            if len(list_pods_with_selector('ue','app=fault-detector')) >0:
+                cmd = ["helm", "uninstall", "fault-detector", "-n", "ue"]
+                run_cmd(cmd)
+                time.sleep(1)                
+            cmd = ["helm", "install", "fault-detector", "tmp/fault_detector_ue/","-n", "ue"]
+            run_cmd(cmd)
+            print('fault detector pod re installed')
+            wait_count = 0
 if __name__ == "__main__":
     main()
