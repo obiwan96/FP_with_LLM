@@ -151,6 +151,7 @@ def helm_upgrade_install(
 
 
 def check_core_function_alive(window: int=5):
+    error_logs_file='tmp/error_logs.txt'
     loki = LokiClient(loki_ip)
     recent_logs = loki.get_recent_logs('oai', window=window)
     error_word = ['[error]', '[critical]', '[fatal]']
@@ -166,7 +167,9 @@ def check_core_function_alive(window: int=5):
                     # SMF failed. need to restart SMF
                     run_cmd(["kubectl", "rollout", "restart", '-n', 'oai', 'deploy/oai-smf'])
                     run_cmd(["kubectl", "rollout", "restart", '-n', 'oai', 'deploy/oai-nrf'])
-                    print('SMF error occured. Rolling SMF.')
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: SMF error occured. Rolling SMF.")
+                    with open(error_logs_file, 'a') as f:
+                        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: SMF error occured. Rolling SMF.\n")
                     return True, 'smf'
                 for known_error in known_error_logs:
                     if known_error in single_log['log']:
@@ -175,6 +178,8 @@ def check_core_function_alive(window: int=5):
                         return True, False # Known error trigger
                 if not is_known_error:
                     print(f"error occured in {single_log['container']}! :{single_log['log']}")
+                    with open(error_logs_file, 'a') as f:
+                        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {single_log['container']} : {single_log['log']}\n")
                     # Send telegram message to me if error occur!
                     requests.post(error_alert_info['url'], json=error_alert_info['body'],headers=error_alert_info['headers'])
                     return True, single_log['container']

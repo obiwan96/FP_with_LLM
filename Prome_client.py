@@ -164,10 +164,10 @@ def pdu_session_delay(loki: LokiClient, start_ns: int, end_ns: int, ns: str='oai
     delays = []
     for supi in t_request:
         if supi in t_accept:
-            delay_ms = (t_accept[supi] - t_request[supi]).total_seconds() * 1000
-            if delay_ms >=0:
+            delay_s = (t_accept[supi] - t_request[supi]).total_seconds()# * 1000
+            if delay_s >=0:
                 # if delay is less than 0, matching is wrong
-                delays.append((supi, delay_ms))
+                delays.append((supi, delay_s))
 
     # 5. 결과 출력
     if not delays:
@@ -374,7 +374,7 @@ def main():
 
         if args.run in ("core", "all"):
             out["core"] = {
-                "pdu_session_delay": float(pdu_session_delay(loki, start_ns=start_ns, end_ns=end_ns,)),
+                "pdu_session_delay_seconds": float(pdu_session_delay(loki, start_ns=start_ns, end_ns=end_ns,)),
                 "amf_registration_rate": amf_registration_rate(loki, start_ns=start_ns, end_ns=end_ns),
                 "upf_throughput": upf_userplane_throughput(prom, start_rfc=start_rfc, end_rfc=end_rfc),
                 "smf_session_drop": int(smf_session_drop_count(loki, start_ns=start_ns, end_ns=end_ns)),

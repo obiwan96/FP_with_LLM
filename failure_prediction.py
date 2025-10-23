@@ -12,9 +12,13 @@ from torch.utils.data import DataLoader, TensorDataset
 import warnings
 from secret import InDB_info, prometheus_ip
 import joblib
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, precision_recall_curve
 from sklearn.utils import resample
 import random
+import matplotlib.pyplot as plt
+from scipy.stats import skew, ttest_ind
+from sklearn.metrics import roc_auc_score, average_precision_score
+import os
 warnings.filterwarnings("ignore")
 
 ''' Usuage
@@ -27,7 +31,7 @@ python train_failure_predictor.py \
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_layers=2):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.3)
         self.fc = nn.Linear(hidden_size, 2)
     def forward(self, x):
         out, _ = self.lstm(x)
@@ -36,11 +40,13 @@ class LSTMModel(nn.Module):
 class GRUModel(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_layers=2):
         super().__init__()
-        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=0.3)
         self.fc = nn.Linear(hidden_size, 2)
     def forward(self, x):
         out, _ = self.gru(x)
-        return self.fc(out[:, -1, :])
+        #return self.fc(out[:, -1, :])
+        out = out.mean(dim=1)
+        return self.fc(out)
 
 class Attention(nn.Module):
     def __init__(self, dim):
@@ -57,7 +63,7 @@ class Attention(nn.Module):
 class GRUWithAttention(nn.Module):
     def __init__(self, input_size, hidden_size=64, num_layers=1):
         super().__init__()
-        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=0.3)
         self.attn = Attention(hidden_size)
         self.fc = nn.Linear(hidden_size, 2)
     def forward(self, x):
@@ -93,39 +99,48 @@ class TCNModel(nn.Module):
 
 # ---------- 데이터 로드 ----------
 def get_prom_metric(prom, metric_name, start, end, step="1m", ns="oai", granularity="pod_avg"):
-    query = f'{metric_name}{{namespace="{ns}"}}'
+    if metric_name.endswith("_total"):
+        # Counter metric은 rate() 처리
+        query = f'rate({metric_name}{{namespace="{ns}"}}[{step}])'
+    else:
+        # Gauge metric은 raw 값 그대로
+        query = f'{metric_name}{{namespace="{ns}"}}'
     data = prom.query_range(query, start=start, end=end, step=step)['data']['result']
-    dfs = []
+    if not data:
+        return pd.DataFrame(columns=["timestamp", metric_name])
+    rows = []
     for item in data:
-        #print (item)
-        if "pod" not in item["metric"]:
-            continue
-        pod = item["metric"]["pod"]
-        df = pd.DataFrame(item["values"], columns=["timestamp", metric_name])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-        df[metric_name] = df[metric_name].astype(float)
-        df.rename(columns={metric_name: f"{metric_name}_{pod}"}, inplace=True)
-        #df["pod"] = pod
-        dfs.append(df)
-    if not dfs:
-        return pd.DataFrame()
-    all_df = pd.concat(dfs)
-    #print(all_df.shape)
+        pod = item["metric"].get("pod", "unknown")
+        container = item["metric"].get("container", "unknown")
+        for ts, val in item["values"]:
+            rows.append({
+                "timestamp": pd.to_datetime(float(ts), unit="s"),
+                "pod": pod,
+                "container": container,
+                metric_name: float(val)
+            })
+
+    df = pd.DataFrame(rows)
+    df = df.copy()
+    # 정렬 및 타입 정리
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp")
     if granularity == "pod_avg":
-        return all_df.groupby("timestamp")[f"{metric_name}_{pod}"].mean().reset_index()
+        return df.groupby("timestamp")[metric_name].mean().reset_index().sort_values("timestamp")
     elif granularity == "pod":
-        return all_df
+        return df.groupby(["timestamp", "pod"])[metric_name].mean().reset_index().sort_values("timestamp")
     elif granularity == "node":
         # ToDo
         # node granularity는 Prometheus label 변경 필요 (예시)
-        return all_df.groupby("timestamp")[f"{metric_name}_{pod}"].mean().reset_index()
-    return all_df
+        return df.groupby("timestamp")[f"{metric_name}_{pod}"].mean(axis=1).reset_index()
+    return df
 
 def get_influx_metrics(influx, start, end, bucket='mdaf'):
     query = f'''
     from(bucket: "{bucket}")
       |> range(start: {start}, stop: {end})
       |> filter(fn: (r) => r["_measurement"] == "core" or r["_measurement"] == "ran")
+      |> filter(fn: (r) => r["_field"] != "pdu_session_delay")
       |> toFloat()
       |> group(columns: []) 
       |> keep(columns: ["_time", "_field", "_value"])
@@ -142,13 +157,13 @@ def get_influx_metrics(influx, start, end, bucket='mdaf'):
 
 def get_failure_and_recovery(influx, start, end, bucket="mdaf"):
     """
-    Influx에서 failure_history와 recovery_history를 모두 읽어 반환.
+    Influx에서 failure_history와 recovery_timestamp를 모두 읽어 반환.
     """
     query = f'''
     from(bucket: "{bucket}")
       |> range(start: {start}, stop: {end})
       |> filter(fn: (r) => r["_measurement"] == "failure_history")
-      |> filter(fn: (r) => r["_field"] == "failure_history" or r["_field"] == "recovery_history")
+      |> filter(fn: (r) => r["_field"] == "failure_history" or r["_field"] == "recovery_timestamp")
       |> filter(fn: (r) => r["_value"] != "slo violation")
       |> keep(columns: ["_time", "_field", "_value"])
     '''
@@ -156,10 +171,9 @@ def get_failure_and_recovery(influx, start, end, bucket="mdaf"):
     if tables.empty:
         print("[WARN] No failure/recovery data found.")
         return pd.DataFrame(columns=["timestamp", "type"])
-
     df = tables[["_time", "_field", "_value"]].rename(columns={"_time": "timestamp", "_field": "type", "_value": "label"})
     df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
-    df["type"] = df["type"].replace({"failure_history": "failure", "recovery_history": "recovery"})
+    df["type"] = df["type"].replace({"failure_history": "failure", "recovery_timestamp": "recovery"})
     return df.sort_values("timestamp").reset_index(drop=True)
 
 def get_slo_violation_history(influx, start, end, bucket='mdaf'):
@@ -172,7 +186,7 @@ def get_slo_violation_history(influx, start, end, bucket='mdaf'):
       |> keep(columns: ["_time", "_value"])
     '''
     tables = influx.query_api().query_data_frame(query)
-    print(tables)
+    print(f'[INFO] total {len(tables)} number of SLO violoation read.')
     if not tables.empty:
         df = tables[["_time", "_value"]].rename(columns={"_time": "timestamp", "_value": "label"})
         df["label"] = 1
@@ -184,8 +198,105 @@ def make_dataset(X, y, window, horizon):
     xs, ys = [], []
     for i in range(len(X) - window - horizon):
         xs.append(X[i : i + window])           # 과거 구간
-        ys.append(y[i + window + horizon - 1]) # 미래 horizon 후 상태
+        future_window = y[i + window : i + window + horizon]
+        label = 1 if np.any(future_window > 0) else 0 
+        ys.append(label)
     return np.array(xs), np.array(ys)
+
+def analyze_features_cli(X, feature_names=None, output_dir="tmp/", skew_threshold=10):
+    """
+    각 feature별 평균, 표준편차, 분산, 왜도(skewness)를 계산하고
+    log 변환이 필요한 feature를 추천합니다.
+    CLI 환경에서도 작동하도록 /tmp 폴더에 히스토그램 이미지를 저장합니다.
+
+    Parameters
+    ----------
+    X : np.ndarray or pd.DataFrame
+        입력 데이터 (shape: [samples, features])
+    feature_names : list or None
+        feature 이름. None이면 f0, f1, ... 자동 생성
+    output_dir : str
+        그래프 저장 디렉토리 (기본: /tmp)
+    skew_threshold : float
+        절댓값이 이 값을 넘는 경우 log 변환 추천
+    """
+    # DataFrame 변환
+    X=X.fillna(0)
+    if isinstance(X, np.ndarray):
+        if feature_names is None:
+            feature_names = [f"f{i}" for i in range(X.shape[1])]
+        df = pd.DataFrame(X, columns=feature_names)
+    else:
+        df = X.copy()
+        feature_names = df.columns
+
+    # 통계량 계산
+    stats = pd.DataFrame({
+        "mean": df.mean(),
+        "std": df.std(),
+        "var": df.var(),
+        "skewness": df.apply(skew)
+    })
+    
+    stats["recommend_log"] = stats["skewness"].abs() > skew_threshold
+
+    print("\n📊 Feature Statistics Summary\n")
+    print(stats.round(4))
+    print("\n💡 Log transform recommended for these features:")
+    print(stats[stats["recommend_log"]].index.tolist())
+
+    # 시각화 저장
+    print(f"\n📁 Saving feature histograms to {output_dir}/ ...")
+    for col in feature_names:
+        plt.figure(figsize=(5, 3))
+        plt.hist(df[col].dropna(), bins=40, color="steelblue", alpha=0.7)
+        plt.title(f"{col}\nmean={df[col].mean():.2f}, skew={skew(df[col]):.2f}")
+        plt.xlabel(col)
+        plt.ylabel("Frequency")
+        plt.tight_layout()
+
+        # 파일 경로
+        save_path = os.path.join(output_dir, f"{col}_hist.png")
+        plt.savefig(save_path)
+        plt.close()
+
+    print("✅ All histograms saved successfully.\n")
+
+    return stats[stats["recommend_log"]].index.tolist()
+
+def analyze_feature_shift(xs, ys, feature_names):
+    """
+    기능:
+      horizon 이후에 abnormal(=1)이 발생한 윈도우 vs 그렇지 않은 윈도우의
+      feature별 평균, 표준편차, 분산 비교표 출력
+    """
+    xs = np.array(xs)  # shape [N, window, D]
+    ys = np.array(ys)  # shape [N,]
+
+    # 윈도우 내 평균값 (시간축 평균)
+    X_window_mean = xs.mean(axis=1)  # shape [N, D]
+
+    # normal / abnormal 그룹 분리
+    X_normal = X_window_mean[ys == 0]
+    X_abnormal = X_window_mean[ys == 1]
+
+    # 통계 요약표 생성
+    stats_df = pd.DataFrame({
+        "normal_mean": X_normal.mean(axis=0),
+        "abnormal_mean": X_abnormal.mean(axis=0),
+        "normal_std": X_normal.std(axis=0),
+        "abnormal_std": X_abnormal.std(axis=0),
+        "mean_diff": X_abnormal.mean(axis=0) - X_normal.mean(axis=0),
+        "p_value": ttest_ind(X_abnormal, X_normal, equal_var=False)[1]
+    }, index=feature_names)
+    
+    print("\n📊 Feature Statistics Comparison (normal vs abnormal)\n")
+    print(stats_df)
+
+    # P-value 가 작은 feature 상위 3개 표시
+    print("\n🔥 Top features with smallest P-value:")
+    print(stats_df["p_value"].abs().sort_values(ascending=True).head(3))
+    return stats_df
 
 # ---------- 메인 ----------
 def main(args):
@@ -199,23 +310,26 @@ def main(args):
         "mem": "container_memory_usage_bytes",
         "net": "container_network_transmit_bytes_total",
         "disk": "container_fs_writes_bytes_total"
+        #"disk2": "container_fs_writes_total"
     }
-
-    end = to_rfc3339()
+    if args.end is not None:
+        end = to_rfc3339(datetime.fromisoformat(args.end.replace("Z", "+00:00")))
+    else:
+        end = to_rfc3339()
     start = to_rfc3339(datetime.fromisoformat(args.start.replace("Z", "+00:00")))
     
     prom_df = [get_prom_metric(prom, m, start, end, step= args.step, granularity=args.granularity).sort_values("timestamp") for m in metrics.values()]
     merged = prom_df[0]
     for df in prom_df[1:]:
         merged = pd.merge_asof(merged.sort_values("timestamp"), df.sort_values("timestamp"), on="timestamp", direction="nearest")
+    #print(merged.columns)
     influx_df = get_influx_metrics(influx, start, end)
 
     # Timestamp 정렬 및 병합
     influx_df = influx_df.sort_values("timestamp")
     merged["timestamp"] = pd.to_datetime(merged["timestamp"]).dt.tz_localize(None)
     influx_df["timestamp"] = pd.to_datetime(influx_df["timestamp"]).dt.tz_localize(None)
-    merged = pd.merge_asof(merged, influx_df, on="timestamp", direction="nearest", tolerance=pd.Timedelta("30s"))
-    print(f'input data shape: {merged.shape}')
+    merged = pd.merge_asof(merged, influx_df, on="timestamp", direction="nearest", tolerance=pd.Timedelta(args.step))
 
     merged["timestamp"] = pd.to_datetime(merged["timestamp"]).dt.tz_localize(None)
     merged = merged.sort_values("timestamp").reset_index(drop=True)
@@ -232,7 +346,8 @@ def main(args):
         print("[INFO] No failure events found.")
     elif not recoveries:
         print("[WARN] No recovery events found. Keeping all data post-failure.")
-
+    print(f"[INFO] total {len(failures)} num. of failures read")
+    print(f"[INFO] total {len(recoveries)} num. of recovery point read")
     drop_ranges = []
     for f_time in failures:
         # f_time 이후의 가장 가까운 recovery_time 찾기
@@ -244,9 +359,11 @@ def main(args):
             r_time = merged["timestamp"].max()
         drop_ranges.append((f_time, r_time))
 
+    '''
     print("[INFO] Excluding failure→recovery intervals:")
     for f, r in drop_ranges:
         print(f"  {f}  →  {r}")
+    '''
 
     # === merged에서 해당 구간 제거 ===
     mask = pd.Series(False, index=merged.index)
@@ -266,28 +383,47 @@ def main(args):
         failure_df,
         on="timestamp",
         direction="forward",
-        tolerance=pd.Timedelta("1m")
+        tolerance=pd.Timedelta(args.step)
     )
-    failure_df = get_slo_violation_history(influx, args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
-    failure_df["timestamp"] = pd.to_datetime(failure_df["timestamp"]).dt.tz_localize(None)
-    #print(failure_df)
-    # Label 병합
-    merged = pd.merge_asof(merged, failure_df, on="timestamp", direction="forward",tolerance=pd.Timedelta("1m"))
-    merged["label"] = (
-        merged.get("label_x", 0).fillna(0).astype(int) |
-        merged.get("label_y", 0).fillna(0).astype(int)
-    )
+    slo_df = get_slo_violation_history(influx, args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
+    slo_df["timestamp"] = pd.to_datetime(slo_df["timestamp"]).dt.tz_localize(None)
+    if args.slo_as_input:
+        merged["label"] = merged.get("label", 0).fillna(0).astype(int)
+        if slo_df.empty:
+            merged["slo_violation"] = 0
+        else:
+            # merged의 각 timestamp에 대해 slo_df 중 (t - step, t] 내 이벤트 수 계산
+            slo_counts = []
+            slo_times = slo_df["timestamp"].values
 
-    merged.drop(columns=[col for col in ["label_x", "label_y"] if col in merged.columns], inplace=True)
+            for t in merged["timestamp"]:
+                count = ((slo_times > (t - pd.Timedelta(args.step)).to_datetime64()) &
+                        (slo_times <= t.to_datetime64())).sum()
+                slo_counts.append(count)
 
-    print (f'Total abnormal row num: {(merged["label"] == 1).sum()}')
+            merged["slo_violation"] = slo_counts
+    #print(slo_df)
+    else:
+        # Label 병합
+        merged = pd.merge_asof(merged, slo_df, on="timestamp", direction="forward",tolerance=pd.Timedelta(args.step))
+        merged["label"] = (
+            merged.get("label_x", 0).fillna(0).astype(int) |
+            merged.get("label_y", 0).fillna(0).astype(int)
+        )
+
+        merged.drop(columns=[col for col in ["label_x", "label_y"] if col in merged.columns], inplace=True)
+
+    print (f'[INFO] Total abnormal row num: {(merged["label"] == 1).sum()}')
     
     # feature transform
     feats = merged.drop(columns=["timestamp", "label"])
+    print(f'[INFO] input data shape: {merged.shape}')
 
     # Remove features that std=0 to prevetn Loss become 0
     df_std = feats.std(axis=0)
     valid_cols = df_std[df_std > 0].index
+    removed_cols = df_std[df_std == 0].index 
+    print("[INFO] Removed columns with std=0:", list(removed_cols))
     feats = feats[valid_cols]
     feature_names = list(feats.columns)
     
@@ -295,13 +431,15 @@ def main(args):
         feats = feats.diff().fillna(0)
     elif args.feature == "var":
         feats = feats.rolling(window=3).var().fillna(0)
-
-    # Normalization
-    scaler = StandardScaler()
-    X = scaler.fit_transform(feats)
-    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        log_recommended_feature_list= analyze_features_cli(feats)
+        for feature_name in log_recommended_feature_list:
+            feats[feature_name] = np.log1p(feats[feature_name])
+    X = feats
     y = merged["label"].values
     X_seq, y_seq = make_dataset(X, y, args.win, args.hor)
+    X_seq = np.nan_to_num(X_seq, nan=0.0, posinf=0.0, neginf=0.0)
+    analyze_feature_shift(X_seq, y_seq, feature_names)
 
     split = int(len(X_seq) * args.train_ratio)
     split_bound = random.randrange(0,split)
@@ -309,6 +447,20 @@ def main(args):
     X_train, y_train = np.append(X_seq[:split_bound],X_seq[split_bound+test_num:],axis=0), np.append(y_seq[:split_bound],y_seq[split_bound+test_num:],axis=0)
     X_test, y_test = X_seq[split_bound:split_bound+test_num], y_seq[split_bound:split_bound+test_num]
     assert(len(X_train)+len(X_test)==len(X_seq))
+
+    # Normalization based on only train data
+    N, T, D = X_train.shape
+    # (N*T, D)로 reshape
+    X_train_flat = X_train.reshape(-1, D)
+    X_test_flat  = X_test.reshape(-1, D)
+    scaler = StandardScaler()
+    X_train_scaled_flat = scaler.fit_transform(X_train_flat)
+    X_test_scaled_flat  = scaler.transform(X_test_flat)
+    X_train = X_train_scaled_flat.reshape(N, T, D)
+    X_test  = X_test_scaled_flat.reshape(X_test.shape[0], T, D)
+    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+    X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
+
     # Oversampling
     normal_idx = np.where(y_train == 0)[0]
     abnormal_idx = np.where(y_train == 1)[0]
@@ -318,6 +470,9 @@ def main(args):
     abnormal_idx_test = np.where(y_test == 1)[0]
     n_normal_test, n_abnormal_test = len(normal_idx_test), len(abnormal_idx_test)
     print(f"[INFO] Test Normal={n_normal_test}, Abnormal={n_abnormal_test}")
+    # Weigth 값은 oversampling 이전에 계산.
+    class_counts = np.bincount(y_train.astype(int))
+    weights = class_counts.sum() / (2.0 * class_counts)
     # abnormal 데이터를 normal 개수의 70~100% 수준까지 복제 (조정 가능)
     target_abn = int(min(n_normal * 0.6, n_abnormal * 10))
     if target_abn > n_abnormal:
@@ -355,8 +510,6 @@ def main(args):
     #    model = TCNModel(input_size)
     else:
         model = LSTMModel(input_size)
-    class_counts = np.bincount(y_train_bal.astype(int))
-    weights = class_counts.sum() / (2.0 * class_counts)
     weights = torch.tensor(weights, dtype=torch.float32)
     print(f"[INFO] Class weights:", weights.tolist())
     #criterion = nn.CrossEntropyLoss()
@@ -398,13 +551,32 @@ def main(args):
     # evaluation
     model.eval()
     preds, trues = [], []
+    probs_val, y_val =[], []
     with torch.no_grad():
         for xb, yb in test_loader:
             out = model(xb)
             preds.extend(torch.argmax(out, 1).numpy())
             trues.extend(yb.numpy())
-    test_f1 = f1_score(trues, preds, average="binary")
 
+        # Threshold 최적화
+        for xb, yb in train_loader:
+            probs_train = torch.softmax(model(xb), dim=1)[:, 1].cpu().numpy()
+            #out = model(xb)
+            #probs_val.extend(torch.argmax(out, 1).numpy())
+            probs_val.extend(probs_train)
+            y_val.extend(yb.numpy())
+    p, r, th  = precision_recall_curve(y_val, probs_val)
+    f1 = (2*p*r/(p+r+1e-12))
+    print(th)
+    best = th[np.argmax(f1[:-1])]  # 마지막 th는 정의 상 제외
+    print("best_th:", best)
+
+    # 테스트 적용
+    pred_test = (preds >= best).astype(int)
+    print("F1_test:", f1_score(trues, pred_test))
+    test_f1 = f1_score(trues, preds, average="binary")
+    print("ROC-AUC:", roc_auc_score(y_test, preds))
+    print("PR-AUC:", average_precision_score(y_test, preds))
     print("\n[RESULT] Classification Report:")    
     print(f"\n[FINAL TEST] F1-score = {test_f1:.4f}")
     print(classification_report(trues, preds, digits=3))
@@ -416,6 +588,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", type=str, default="2025-10-14T10:00:00Z")
+    parser.add_argument("--end", type=str)
     parser.add_argument("--win", type=int, default=10)
     parser.add_argument("--hor", type=int, default=5)
     parser.add_argument("--train_ratio", type=float, default=0.8)
@@ -426,5 +599,6 @@ if __name__ == "__main__":
     parser.add_argument("--granularity", type=str, choices=["pod", "node", "pod_avg"], default="pod_avg")
     parser.add_argument("--feature", type=str, choices=["raw", "diff", "var"], default="raw")
     parser.add_argument("--model", type=str, choices=["LSTM", "GRU", "GRU_Att"], default="GRU")
+    parser.add_argument("--slo-as-input", action='store_true')
     args = parser.parse_args()
     main(args)
