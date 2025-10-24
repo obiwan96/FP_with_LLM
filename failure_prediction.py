@@ -660,8 +660,7 @@ def main(args):
     # Oversampling
     normal_idx = np.where(y_train == 0)[0]
     abnormal_idx = np.where(y_train == 1)[0]
-    n_normal, n_abnormal = len(normal_idx), len(abnormal_idx)
-    alpha = torch.tensor([n_abnormal/(n_normal+n_abnormal), n_normal/(n_normal+n_abnormal)])
+    n_normal, n_abnormal = len(normal_idx), len(abnormal_idx)    
     print(f"[INFO] Train Normal={n_normal}, Abnormal={n_abnormal}")
     normal_idx_test = np.where(y_test == 0)[0]
     abnormal_idx_test = np.where(y_test == 1)[0]
@@ -726,7 +725,7 @@ def main(args):
             optimizer.zero_grad()
             out = model(xb)
             #loss = criterion(out, yb.float())
-            loss = focal_loss_ce(out, yb, alpha= alpha)
+            loss = focal_loss_ce(out, yb)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
