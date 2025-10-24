@@ -1,9 +1,0 @@
-0
-container_cpu_usage_seconds_total
-container_memory_usage_bytes
-container_network_transmit_bytes_total
-container_fs_writes_bytes_total
-amf_registration_rate
-pdu_session_delay_seconds
-rrc_state_counts
-upf_throughput
