@@ -3,7 +3,7 @@
   'imagePullSecrets': []
   'storageClass': ''
   'nodeSelector': &id001
-    'kubernetes.io/hostname': 'kube-167'
+    'kubernetes.io/hostname': 'kube-170'
 'kubeVersion': ''
 'nameOverride': ''
 'fullnameOverride': ''
@@ -20,7 +20,7 @@
   'debug': !!bool 'false'
 'name': 'ueransim-ue'
 'count': !!int '1'
-'initialMSISDN': '0000000159'
+'initialMSISDN': '0000000157'
 'mcc': '001'
 'mnc': '01'
 'key': 'fec86ba6eb707ed08905757b1bb44b8f'

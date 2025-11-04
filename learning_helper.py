@@ -240,16 +240,18 @@ def train_and_eval(model, train_loader, val_loader, optimizer, criterion, device
     return f1_best, roc, pr, best_th
 
 # ✅ Optuna objective
-def objective(trial, X_raw, y_raw, timestamps, failures, device):
+def objective(trial, X_raw, y_raw, timestamps, failures, device, model_name = None):
     hidden_size = trial.suggest_int("hidden_size", 32, 256, step=32)
     dropout = trial.suggest_float("dropout", 0.1, 0.5)
     lr = trial.suggest_loguniform("lr", 1e-5, 1e-3)
     alpha = trial.suggest_float("alpha", 0.6, 1.0)
     gamma = trial.suggest_float("gamma", 0.5, 3.0)
     temperature = trial.suggest_float("temperature", 0.5, 3.0)
-    window = trial.suggest_int("window", 10, 15,20)
-    horizon = trial.suggest_int("horizon", 2, 5)
-    model_name = trial.suggest_categorical("model_name", ["LSTM", "GRU", "GRU_Att", "CNV_GRU"])
+    window = trial.suggest_int("window", 5,15, step=5)
+    horizon = trial.suggest_categorical("horizon", [0,1,2,3, 5])
+    if model_name is None:
+        model_name = trial.suggest_categorical("model_name", ["LSTM", "GRU", "GRU_Att", "CNV_GRU"])
+
     X_seq, y_seq, ts_seq = make_soft_dataset(X_raw, y_raw, timestamps, window, horizon, mode="linear")
 
     # --- Event-based 3-fold CV ---
@@ -286,7 +288,7 @@ def objective(trial, X_raw, y_raw, timestamps, failures, device):
 
         criterion = lambda logits, targets: focal_loss_ce(logits, targets, alpha=alpha, gamma=gamma)
         train_loader = DataLoader(TensorDataset(torch.tensor(X_tr, dtype=torch.float32),
-                                                torch.tensor(y_tr, dtype=torch.float32)), batch_size=64, shuffle=True)
+                                                torch.tensor(y_tr, dtype=torch.float32)), batch_size=64, shuffle=False)
         val_loader = DataLoader(TensorDataset(torch.tensor(X_val, dtype=torch.float32),
                                               torch.tensor(y_val, dtype=torch.float32)), batch_size=64, shuffle=False)
         best_f1 = 0
@@ -300,10 +302,10 @@ def objective(trial, X_raw, y_raw, timestamps, failures, device):
     trial.report(score, step=1)
     return score
 
-def study_optuna(X_raw, y_raw, timestamps, failures, device, n_trials=40, timeout=7200):
-    sampler = optuna.samplers.TPESampler(seed=42)
+def study_optuna(X_raw, y_raw, timestamps, failures, device, timeout=None, model_name=None):
+    #sampler = optuna.samplers.TPESampler(seed=42)
     # No pruner: 성능 지속적으로 낮을 경우 멈춰버리는 pruner을 일단 끔.
-    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=optuna.pruners.NopPruner())
+    study = optuna.create_study(direction="maximize")
     objective_with_data = partial(
         objective,
         X_raw=X_raw,
@@ -311,9 +313,10 @@ def study_optuna(X_raw, y_raw, timestamps, failures, device, n_trials=40, timeou
         timestamps=timestamps,
         failures=failures,
         device=device,
+        model_name=model_name
     )
 
-    study.optimize(objective_with_data, n_trials=n_trials, timeout=timeout)
+    study.optimize(objective_with_data, timeout=timeout)
     print("✅ Best Params:", study.best_params)
     print("✅ Best Composite Score:", study.best_value)
     fig1 = vis.plot_optimization_history(study)

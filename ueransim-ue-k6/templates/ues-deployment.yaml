@@ -84,7 +84,7 @@ spec:
               while true; do
                 # k6 실패해도 스크립트가 죽지 않게
                 k6 run --local-ips="${UEIP}" /scripts/script.js || echo "[k6] run failed; retrying"
-                sleep 30
+                sleep 20
               done
 
           resources:

@@ -409,6 +409,8 @@ def main():
             time.sleep(int(args.interval.rstrip("m"))*60)
             wait_count+=int(args.interval.rstrip("m"))*60
         if wait_count > 60*5:
+            # frequent reload causes cell shortage.
+            continue
             # Reload fault-detector pod to check new UE registration works well
             if len(list_pods_with_selector('ue','app=fault-detector')) >0:
                 cmd = ["helm", "uninstall", "fault-detector", "-n", "ue"]

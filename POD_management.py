@@ -42,9 +42,11 @@ from kubernetes.stream import stream
 from kubernetes import client, config
 from kubernetes.stream import stream
 from Prome_helper import *
-from secret import loki_ip, error_alert_info
+from secret import loki_ip, error_alert_info, prometheus_ip
 import requests
 import random
+import os
+import pickle as pkl
 
 helm_repo_path='ueransim-ue-k6'
 # ------------------------------
@@ -149,8 +151,21 @@ def helm_upgrade_install(
     run_cmd(cmd)
     logging.info("Helm 설치/업그레이드 완료")
 
+def check_restart(window):
+    window = str(window)+'m'
+    prom = PrometheusClient(prometheus_ip)
+    query = f'increase(kube_pod_container_status_restarts_total{{namespace="oai"}}[{window}]) > 0'
+    resp = prom.query(query)
+    data = resp["data"]["result"]
+    for r in data:
+        pod = r["metric"].get("pod", "unknown")
+        container = r["metric"].get("container", "unknown")
+        count = float(r["value"][1])
+        return container
+    return False
 
 def check_core_function_alive(window: int=5):
+    error_alert_body = error_alert_info['body']
     error_logs_file='tmp/error_logs.txt'
     loki = LokiClient(loki_ip)
     recent_logs = loki.get_recent_logs('oai', window=window)
@@ -170,6 +185,9 @@ def check_core_function_alive(window: int=5):
                     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: SMF error occured. Rolling SMF.")
                     with open(error_logs_file, 'a') as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: SMF error occured. Rolling SMF.\n")
+                    save_recent_logs(loki, 'smf')
+                    error_alert_body ['text'] = f'error occured in smf. restarted pods'
+                    requests.post(error_alert_info['url'], json=error_alert_body,headers=error_alert_info['headers'])
                     return True, 'smf'
                 for known_error in known_error_logs:
                     if known_error in single_log['log']:
@@ -181,9 +199,29 @@ def check_core_function_alive(window: int=5):
                     with open(error_logs_file, 'a') as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {single_log['container']} : {single_log['log']}\n")
                     # Send telegram message to me if error occur!
-                    requests.post(error_alert_info['url'], json=error_alert_info['body'],headers=error_alert_info['headers'])
+                    error_alert_body['text'] = f"error occured in {single_log['container']}! :{single_log['log']}"
+                    requests.post(error_alert_info['url'], json=error_alert_body,headers=error_alert_info['headers'])
+                    save_recent_logs(loki, single_log['container'])
                     return True, single_log['container']
+    restart_check_result =check_restart(window)
+    if restart_check_result:
+        error_alert_body['text'] = f"{restart_check_result} pod restarted!"
+        requests.post(error_alert_info['url'], json=error_alert_body,headers=error_alert_info['headers'])
+        save_recent_logs(loki, restart_check_result)
+        return True, restart_check_result
     return False, None
+
+def save_recent_logs(loki_client, container_name, window=45):
+    recent_logs = loki_client.get_recent_logs(namespace='oai',container= container_name, window=window)
+    fine_name=f"tmp/fault_pod_logs_{window}min.pkl"
+    if os.path.exists(fine_name):
+        with open(fine_name, "rb") as f:
+            old_logs = pkl.load(f)
+    else:
+        old_logs = []
+    old_logs.append((datetime.now().strftime('%Y-%m-%d %H:%M:%S'),container_name, recent_logs))
+    with open(fine_name, "wb") as f:
+        pkl.dump(old_logs, f)
 
 # ------------------------------
 # K8s Pod 대기 & Exec
@@ -317,11 +355,11 @@ def main():
                 data = {'num': ue_num}
                 json.dump(data,f)
             #wait for little seconds
-            time.sleep(40)
+            time.sleep(20)
         if args.soft:
             new_ue_num = random.randrange(-2,5)
         else:
-            new_ue_num = random.randrange(-10,20)
+            new_ue_num = random.randrange(-15,35)
         if new_ue_num+ue_num<3:
             new_ue_num = 2
         elif new_ue_num+ue_num>ue_threshold:
@@ -339,7 +377,7 @@ def main():
         if args.soft:
             time.sleep(random.randrange(30*6,30*8))
         else:
-            time.sleep(random.randrange(5,15))
+            time.sleep(random.randrange(10,25))
 
 def run_cmd(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     logging.debug("RUN: %s", " ".join(shlex.quote(c) for c in cmd))

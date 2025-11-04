@@ -5,10 +5,10 @@ from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 import os
 
-TARGET_URL = "http://10.98.186.111:80"
-CHECK_INTERVAL = 10  # seconds
-SLO_LATENCY = 0.2  # seconds
-SLO_FAIL_RATIO = 0.01
+TARGET_URL = os.getenv("TARGET_URL")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL"))  # seconds
+SLO_LATENCY = float(os.getenv("SLO_LATENCY"))  # seconds
+SLO_FAIL_RATIO = float(os.getenv("SLO_FAIL_RATIO"))
 
 INFLUX_URL   = os.getenv("INFLUX_URL")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN") 
@@ -25,7 +25,7 @@ write_api = client.write_api(write_options=SYNCHRONOUS)
 def check_web_health():
     total, fail = 0, 0
     latencies = []
-    for _ in range(5):
+    for _ in range(10):
         start = time.time()
         try:
             r = requests.get(TARGET_URL, timeout=3)
@@ -65,7 +65,7 @@ def main():
             if avg_lat > SLO_LATENCY or fail_ratio > SLO_FAIL_RATIO:
                 print(f"[ALERT] SLO violation: latency={avg_lat:.3f}, fail_ratio={fail_ratio:.2f}")
                 write_slo_violation()
-                requests.post(alarm_url, json=alarm_body, headers=alarm_headers)
+                #requests.post(alarm_url, json=alarm_body, headers=alarm_headers)
             else:
                 print(f"[OK] latency={avg_lat:.3f}s, fail={fail}/{total}")
         time.sleep(CHECK_INTERVAL)

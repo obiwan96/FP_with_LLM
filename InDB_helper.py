@@ -23,14 +23,19 @@ def InDB_write(metric_name:str, field_name:str, data, abnormality=False, timesta
 
     write_api.write(bucket = bucket, org=org, record=point)
 
-def InDB_write_recovery_timestamp(timestamp:datetime):
+def InDB_write_recovery_timestamp(timestamp:datetime, abnormal):
     client = InfluxDBClient(url=url, token=token, org=org)
     write_api = client.write_api(write_options=SYNCHRONOUS)
-
-    point = Point('failure_history') \
-        .field('recovery_timestamp', 'recovery') \
-        .time(timestamp, WritePrecision.NS)
-
+    if abnormal:
+        point = Point('failure_history') \
+            .tag("abnormality", 0) \
+            .field('failure_history', abnormal) \
+            .time(timestamp, WritePrecision.NS)
+    else:
+        point = Point('failure_history') \
+            .field('recovery_timestamp', 'recovery') \
+            .time(timestamp, WritePrecision.NS)
+    print(point)
     write_api.write(bucket = bucket, org=org, record=point)
 
 # InDB delete:
@@ -91,10 +96,12 @@ def InDB_inquiry_now(interval:int=10):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument("--time", type=str, help='e.g. 2025-10-14T15:00:00Z, Korean time')
+    ap.add_argument("--abnormal", type=str, help = 'abnormal container name')
     args= ap.parse_args()
     if args.time:
         # Korean time!
         data_time=datetime.fromisoformat(args.time.replace("Z", "+09:00"))
+        print (data_time)
     else: 
         data_time= datetime.now(timezone.utc)
-    InDB_write_recovery_timestamp(data_time)
+    InDB_write_recovery_timestamp(data_time, args.abnormal)

@@ -129,7 +129,8 @@ def get_prom_metric(prom, metric_name, start, end, step="1m", ns="oai", granular
     # 기본: 원본
     return df
 
-def get_influx_metrics(influx, start, end, bucket='mdaf'):
+def get_influx_metrics(start, end, bucket='mdaf'):
+    influx = InfluxDBClient(InDB_info['url'], token=InDB_info['token'], org=InDB_info['org'])
     query = f'''
     from(bucket: "{bucket}")
       |> range(start: {start}, stop: {end})
@@ -149,10 +150,11 @@ def get_influx_metrics(influx, start, end, bucket='mdaf'):
     df = df.reset_index()
     return df
 
-def get_failure_and_recovery(influx, start, end, bucket="mdaf"):
+def get_failure_and_recovery(start, end, bucket="mdaf"):
     """
     Influx에서 failure_history와 recovery_timestamp를 모두 읽어 반환.
     """
+    influx = InfluxDBClient(InDB_info['url'], token=InDB_info['token'], org=InDB_info['org'])
     query = f'''
     from(bucket: "{bucket}")
       |> range(start: {start}, stop: {end})
@@ -170,7 +172,8 @@ def get_failure_and_recovery(influx, start, end, bucket="mdaf"):
     df["type"] = df["type"].replace({"failure_history": "failure", "recovery_timestamp": "recovery"})
     return df.sort_values("timestamp").reset_index(drop=True)
 
-def get_slo_violation_history(influx, start, end, bucket='mdaf'):
+def get_slo_violation_history(start, end, bucket='mdaf'):
+    influx = InfluxDBClient(InDB_info['url'], token=InDB_info['token'], org=InDB_info['org'])
     query = f'''
     from(bucket: "{bucket}")
       |> range(start: {start}, stop: {end})
@@ -188,14 +191,25 @@ def get_slo_violation_history(influx, start, end, bucket='mdaf'):
     
     return pd.DataFrame(columns=["timestamp", "label"])
 
-# ---------- 메인 ----------
-def main(args):
-    print(f"\n[INFO] Starting training with model={args.model}, granularity={args.granularity}, feature={args.feature}\n")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def put_slo_violation_as_input(merged, slo_df, step, if_failure_data_exist=False):
+    if if_failure_data_exist:
+        merged["label"] = merged.get("label", 0).fillna(0).astype(int)
+    if slo_df.empty:
+        merged["slo_violation"] = 0
+    else:
+        # merged의 각 timestamp에 대해 slo_df 중 (t - step, t] 내 이벤트 수 계산
+        slo_counts = []
+        slo_times = slo_df["timestamp"].values
 
-    prom = PrometheusClient(prometheus_ip)
-    influx = InfluxDBClient(InDB_info['url'], token=InDB_info['token'], org=InDB_info['org'])
+        for t in merged["timestamp"]:
+            count = ((slo_times > (t - pd.Timedelta(step)).to_datetime64()) &
+                    (slo_times <= t.to_datetime64())).sum()
+            slo_counts.append(count)
 
+        merged["slo_violation"] = slo_counts
+    return merged
+
+def get_prometheus_data(start, end, step, granularity):
     metrics = {
         "cpu": "container_cpu_usage_seconds_total",
         "mem": "container_memory_usage_bytes",
@@ -204,30 +218,45 @@ def main(args):
         "disk": "container_fs_writes_bytes_total"
         #"disk2": "container_fs_writes_total"
     }
+    prom = PrometheusClient(prometheus_ip)
+    prom_df = [get_prom_metric(prom, m, start, end, step= step, granularity=granularity).sort_values("timestamp") for m in metrics.values()]
+    merged = prom_df[0]
+    for df in prom_df[1:]:
+        merged = pd.merge_asof(merged.sort_values("timestamp"), df.sort_values("timestamp"), on="timestamp", direction="nearest")
+    #print(merged.columns)
+    return merged
+
+def get_merged_data(start, end, step, granularity):
+    merged = get_prometheus_data(start, end,step, granularity)
+    influx_df = get_influx_metrics(start, end)
+
+    # Timestamp 정렬 및 병합
+    influx_df = influx_df.sort_values("timestamp")
+    merged["timestamp"] = pd.to_datetime(merged["timestamp"]).dt.tz_localize(None)
+    influx_df["timestamp"] = pd.to_datetime(influx_df["timestamp"]).dt.tz_localize(None)
+    merged = pd.merge_asof(merged, influx_df, on="timestamp", direction="nearest", tolerance=pd.Timedelta(step))
+
+    merged["timestamp"] = pd.to_datetime(merged["timestamp"]).dt.tz_localize(None)
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
+    return merged
+
+# ---------- 메인 ----------
+def main(args):
+    print(f"\n[INFO] Starting training with model={args.model}, granularity={args.granularity}, feature={args.feature}\n")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+   
     if args.end is not None:
         end = to_rfc3339(datetime.fromisoformat(args.end.replace("Z", "+00:00")))
     else:
         end = to_rfc3339()
     start = to_rfc3339(datetime.fromisoformat(args.start.replace("Z", "+00:00")))
     
-    prom_df = [get_prom_metric(prom, m, start, end, step= args.step, granularity=args.granularity).sort_values("timestamp") for m in metrics.values()]
-    merged = prom_df[0]
-    for df in prom_df[1:]:
-        merged = pd.merge_asof(merged.sort_values("timestamp"), df.sort_values("timestamp"), on="timestamp", direction="nearest")
-    #print(merged.columns)
-    influx_df = get_influx_metrics(influx, start, end)
-
-    # Timestamp 정렬 및 병합
-    influx_df = influx_df.sort_values("timestamp")
-    merged["timestamp"] = pd.to_datetime(merged["timestamp"]).dt.tz_localize(None)
-    influx_df["timestamp"] = pd.to_datetime(influx_df["timestamp"]).dt.tz_localize(None)
-    merged = pd.merge_asof(merged, influx_df, on="timestamp", direction="nearest", tolerance=pd.Timedelta(args.step))
-
-    merged["timestamp"] = pd.to_datetime(merged["timestamp"]).dt.tz_localize(None)
-    merged = merged.sort_values("timestamp").reset_index(drop=True)
+    
+    # Read X data
+    merged = get_merged_data(start, end, args.step, args.granularity)
 
     # === 고장/회복 데이터 읽기 ===
-    events_df = get_failure_and_recovery(influx, start, end)
+    events_df = get_failure_and_recovery(start, end)
 
     # === failure-recovery 구간 식별 ===
     failures = events_df[events_df["type"] == "failure"]["timestamp"].tolist()
@@ -241,7 +270,13 @@ def main(args):
     print(f"[INFO] total {len(failures)} num. of failures read")
     print(f"[INFO] total {len(recoveries)} num. of recovery point read")
     drop_ranges = []
+    r_time = None
+    ori_failure = []
     for f_time in failures:
+        if r_time and f_time < r_time:
+            continue
+        print(f_time)
+        ori_failure.append(f_time)
         # f_time 이후의 가장 가까운 recovery_time 찾기
         rec_after = [r for r in recoveries if r > f_time]
         if rec_after:
@@ -250,7 +285,6 @@ def main(args):
             # recovery가 없는 마지막 고장은 데이터 끝까지 제거
             r_time = merged["timestamp"].max()
         drop_ranges.append((f_time, r_time))
-
     '''
     print("[INFO] Excluding failure→recovery intervals:")
     for f, r in drop_ranges:
@@ -260,7 +294,7 @@ def main(args):
     # === merged에서 해당 구간 제거 ===
     mask = pd.Series(False, index=merged.index)
     for f, r in drop_ranges:
-        mask |= (merged["timestamp"] >= f) & (merged["timestamp"] <= r)
+        mask |= (merged["timestamp"] > f) & (merged["timestamp"] < r)
 
     before = len(merged)
     merged = merged.loc[~mask].reset_index(drop=True)
@@ -277,23 +311,10 @@ def main(args):
         direction="forward",
         tolerance=pd.Timedelta(args.step)
     )
-    slo_df = get_slo_violation_history(influx, args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
+    slo_df = get_slo_violation_history(args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
     slo_df["timestamp"] = pd.to_datetime(slo_df["timestamp"]).dt.tz_localize(None)
     if args.slo_as_input:
-        merged["label"] = merged.get("label", 0).fillna(0).astype(int)
-        if slo_df.empty:
-            merged["slo_violation"] = 0
-        else:
-            # merged의 각 timestamp에 대해 slo_df 중 (t - step, t] 내 이벤트 수 계산
-            slo_counts = []
-            slo_times = slo_df["timestamp"].values
-
-            for t in merged["timestamp"]:
-                count = ((slo_times > (t - pd.Timedelta(args.step)).to_datetime64()) &
-                        (slo_times <= t.to_datetime64())).sum()
-                slo_counts.append(count)
-
-            merged["slo_violation"] = slo_counts
+        merged= put_slo_violation_as_input(merged, slo_df, args.step, True)
     #print(slo_df)
     else:
         # Label 병합
@@ -330,10 +351,26 @@ def main(args):
         log_recommended_feature_list= analyze_features_cli(feats)
         for feature_name in log_recommended_feature_list:
             feats[feature_name] = np.log1p(feats[feature_name])
-    X = feats
+    X = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
     y = merged["label"].values
     if args.optuna:
-        study = study_optuna(X, y, timestamps, failures, device)
+        if args.model:
+            study = study_optuna(X, y, timestamps, failures, device, timeout = 30, model_name=args.model)
+            df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
+            df = df[df["state"] == "COMPLETE"]
+            best_per_combo = (
+                df.loc[df.groupby(["params_window", "params_horizon"])["value"].idxmin()]
+                .sort_values("value")
+                .reset_index(drop=True)
+            )
+            print(best_per_combo[
+                ["params_window", "params_horizon", "value",
+                "params_hidden_size", "params_dropout", "params_lr",
+                "params_alpha", "params_gamma", "params_temperature"]
+            ])
+            return
+        else:
+            study = study_optuna(X, y, timestamps, failures, device)        
         best_params = study.best_params
         X_seq, y_seq, ts_seq = make_soft_dataset(X, y, timestamps, best_params["window"], best_params["horizon"], mode="linear")
         if best_params["model_name"] == 'LSTM':
@@ -415,7 +452,10 @@ def main(args):
     assert(len(X_train)+len(X_test)==len(X_seq))
     plt.figure(figsize=(10,2))
     plt.scatter(ts_seq, np.zeros(len(ts_seq)), s=3, c='gray', label='Samples')
-    plt.scatter(failures, np.full(len(failures), 0.1), s=20, c='red', label='Failures')  # ✅ 수정된 부분
+    plt.scatter(ori_failure, np.full(len(ori_failure), 0.1), s=3, c='red', label='Failures')  # ✅ 수정된 부분
+    plt.scatter(failures, np.full(len(failures), 0.05), s=3, c='orange', label='Used Failures')  # 실제 학습에 사용된 failure
+    for rec_time in recoveries:
+        plt.axvline(rec_time, color='green', linestyle=':', alpha=0.5)
     plt.axvline(cutoff_time, color='blue', linestyle='--', label='Cutoff')
     plt.legend()
     plt.title("Train/Test Split by Failure Ratio (Soft Dataset)")
@@ -507,9 +547,9 @@ def main(args):
     print("AUPRC: {:.4f}".format(pr))
     print("[INFO] Saving SHAP-related resources...")
     torch.save(model.state_dict(), f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}.pt")               # 학습된 가중치
-    joblib.dump(scaler, f"tmp/models/{args.model}_win{args.win}_hor{args.hor}_{int(f1*100)}_scaler.joblib")                     # normalization 객체
+    joblib.dump(scaler, f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}_scaler.joblib")                     # normalization 객체
     pd.Series(feature_names).to_csv("feature_names.csv", index=False)  # feature 이름
-    np.save(f"tmp/models/{args.model}_win{args.win}_hor{args.hor}_{int(f1*100)}_bg_samples.npy", X_train[:512])             # 학습셋 일부 (SHAP background)
+    np.save(f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}_bg_samples.npy", X_train[:512])             # 학습셋 일부 (SHAP background)
     print(f"Model saved in 'tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}.pt'.")
     del model, optimizer
     torch.cuda.empty_cache()
@@ -523,12 +563,12 @@ if __name__ == "__main__":
     parser.add_argument("--hor", type=int, default=5)
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--batch", type=int, default=64)
-    parser.add_argument("--step", type=str, default='1m', help="step for Prometheus, e.g. 1m, 30s")
+    parser.add_argument("--step", type=str, default='2m', help="step for Prometheus, e.g. 1m, 30s")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--granularity", type=str, choices=["pod", "domain", "pod_avg"], default="pod_avg")
     parser.add_argument("--feature", type=str, choices=["raw", "diff", "var"], default="raw")
-    parser.add_argument("--model", type=str, choices=["LSTM", "GRU", "GRU_Att", "CNV_GRU"], default="GRU")
+    parser.add_argument("--model", type=str, choices=["LSTM", "GRU", "GRU_Att", "CNV_GRU"])
     parser.add_argument("--slo-as-input", action='store_true')
     parser.add_argument("--optuna", action='store_true')
     args = parser.parse_args()

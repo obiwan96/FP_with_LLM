@@ -11,11 +11,11 @@ data:
       scenarios: {
         web: {
           executor: 'constant-arrival-rate',
-          rate: 500,              // 초당 요청 수 (먼저 50부터, 점진 상승)
+          rate: 1500,              // 초당 요청 수 (먼저 50부터, 점진 상승)
           timeUnit: '1s',
           duration: '2m',
-          preAllocatedVUs: 70,
-          maxVUs: 100,
+          preAllocatedVUs: 80,
+          maxVUs: 200,
         },
       },
       // 연결 재사용 유지(기본값 false가 아님을 명시적으로)
@@ -25,7 +25,7 @@ data:
       discardResponseBodies: true,
     };
 
-    const BASE = 'http://10.98.186.111:80';   // 목표 URL/도메인 바꾸세요
+    const BASE = 'http://10.104.237.85:80';   // 목표 URL/도메인 바꾸세요
     export default function () {
       http.get(BASE);
       sleep(0.5 + Math.random());
