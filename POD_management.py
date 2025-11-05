@@ -214,18 +214,21 @@ def check_core_function_alive(window: int=5):
         return True, restart_check_result
     return False, None
 
-def save_recent_logs(loki_client, container_name, window=45):
-    recent_logs = loki_client.get_recent_logs(namespace='oai',container= container_name, window=window)
-    fine_name=f"tmp/fault_pod_logs_{window}min.pkl"
+def save_recent_logs(loki_client, container_name, window=45, failure_time=None):
+    if failure_time:
+        failure_time=datetime.strptime(failure_time, '%Y-%m-%dT%H:%M:%S')
+    recent_logs = loki_client.get_recent_logs(namespace='oai',container= container_name, window=window, end_time=failure_time)
+    fine_name=f"tmp/fault_pod_logs.pkl"
     if os.path.exists(fine_name):
         with open(fine_name, "rb") as f:
             old_logs = pkl.load(f)
     else:
         old_logs = []
-    old_logs.append((datetime.now().strftime('%Y-%m-%d %H:%M:%S'),container_name, recent_logs))
+    old_logs.append((datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),container_name, recent_logs))
     with open(fine_name, "wb") as f:
         pkl.dump(old_logs, f)
     print('[INFO] error logs dumped in fault_pod_logs pickle file')
+    print(f'[INFO] now we have {len(old_logs)} num. of fault data')
 
 # ------------------------------
 # K8s Pod 대기 & Exec

@@ -6,7 +6,7 @@ from influxdb_client import InfluxDBClient
 from Prome_helper import PrometheusClient, to_rfc3339
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report
-from torch import nn, optim
+from torch import optim
 import torch, gc
 from torch.utils.data import DataLoader, TensorDataset
 import warnings
@@ -18,6 +18,7 @@ from scipy.stats import pearsonr
 from sklearn.metrics import roc_auc_score, average_precision_score
 import os
 from learning_helper import *
+import pickle as pkl
 warnings.filterwarnings("ignore")
 
 ''' Usuage
@@ -243,119 +244,125 @@ def get_merged_data(start, end, step, granularity):
 # ---------- 메인 ----------
 def main(args):
     print(f"\n[INFO] Starting training with model={args.model}, granularity={args.granularity}, feature={args.feature}\n")
+    file_path = f"tmp/data/{args.feature}_{args.granularity}_{'sloasinput' if args.slo_as_input else ''}_stepsize{args.step}.pkl"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
    
-    if args.end is not None:
-        end = to_rfc3339(datetime.fromisoformat(args.end.replace("Z", "+00:00")))
+    if args.use_pickle:
+        with open(file_path, 'rb') as f:
+            dataset= pkl.load(f)
+        print(f'📁 Load datset from {file_path}')
+        X,y, timestamps, failures = dataset
     else:
-        end = to_rfc3339()
-    start = to_rfc3339(datetime.fromisoformat(args.start.replace("Z", "+00:00")))
-    
-    
-    # Read X data
-    merged = get_merged_data(start, end, args.step, args.granularity)
-
-    # === 고장/회복 데이터 읽기 ===
-    events_df = get_failure_and_recovery(start, end)
-
-    # === failure-recovery 구간 식별 ===
-    failures = events_df[events_df["type"] == "failure"]["timestamp"].tolist()
-    recoveries = events_df[events_df["type"] == "recovery"]["timestamp"].tolist()
-
-    # recovery가 없을 경우 대비
-    if not failures:
-        print("[INFO] No failure events found.")
-    elif not recoveries:
-        print("[WARN] No recovery events found. Keeping all data post-failure.")
-    print(f"[INFO] total {len(failures)} num. of failures read")
-    print(f"[INFO] total {len(recoveries)} num. of recovery point read")
-    drop_ranges = []
-    r_time = None
-    ori_failure = []
-    for f_time in failures:
-        if r_time and f_time < r_time:
-            continue
-        print(f_time)
-        ori_failure.append(f_time)
-        # f_time 이후의 가장 가까운 recovery_time 찾기
-        rec_after = [r for r in recoveries if r > f_time]
-        if rec_after:
-            r_time = min(rec_after)
+        if args.end is not None:
+            end = to_rfc3339(datetime.fromisoformat(args.end.replace("Z", "+00:00")))
         else:
-            # recovery가 없는 마지막 고장은 데이터 끝까지 제거
-            r_time = merged["timestamp"].max()
-        drop_ranges.append((f_time, r_time))
-    '''
-    print("[INFO] Excluding failure→recovery intervals:")
-    for f, r in drop_ranges:
-        print(f"  {f}  →  {r}")
-    '''
+            end = to_rfc3339()
+        start = to_rfc3339(datetime.fromisoformat(args.start.replace("Z", "+00:00")))
+        
+        
+        # Read X data
+        merged = get_merged_data(start, end, args.step, args.granularity)
 
-    # === merged에서 해당 구간 제거 ===
-    mask = pd.Series(False, index=merged.index)
-    for f, r in drop_ranges:
-        mask |= (merged["timestamp"] > f) & (merged["timestamp"] < r)
+        # === 고장/회복 데이터 읽기 ===
+        events_df = get_failure_and_recovery(start, end)
 
-    before = len(merged)
-    merged = merged.loc[~mask].reset_index(drop=True)
-    after = len(merged)
-    print(f"[INFO] Removed {before - after} rows between failure→recovery intervals.")
+        # === failure-recovery 구간 식별 ===
+        failures = events_df[events_df["type"] == "failure"]["timestamp"].tolist()
+        recoveries = events_df[events_df["type"] == "recovery"]["timestamp"].tolist()
 
-    # === 이후 failure label 태깅 (회복된 이후 데이터만 포함) ===
-    failure_df = pd.DataFrame({"timestamp": failures})
-    failure_df["label"] = 1
-    merged = pd.merge_asof(
-        merged,
-        failure_df,
-        on="timestamp",
-        direction="forward",
-        tolerance=pd.Timedelta(args.step)
-    )
-    slo_df = get_slo_violation_history(args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
-    slo_df["timestamp"] = pd.to_datetime(slo_df["timestamp"]).dt.tz_localize(None)
-    if args.slo_as_input:
-        merged= put_slo_violation_as_input(merged, slo_df, args.step, True)
-    #print(slo_df)
-    else:
-        # Label 병합
-        merged = pd.merge_asof(merged, slo_df, on="timestamp", direction="forward",tolerance=pd.Timedelta(args.step))
-        merged["label"] = (
-            merged.get("label_x", 0).fillna(0).astype(int) |
-            merged.get("label_y", 0).fillna(0).astype(int)
+        # recovery가 없을 경우 대비
+        if not failures:
+            print("[INFO] No failure events found.")
+        elif not recoveries:
+            print("[WARN] No recovery events found. Keeping all data post-failure.")
+        print(f"[INFO] total {len(failures)} num. of failures read")
+        print(f"[INFO] total {len(recoveries)} num. of recovery point read")
+        drop_ranges = []
+        r_time = None
+        ori_failure = []
+        for f_time in failures:
+            if r_time and f_time < r_time:
+                continue
+            ori_failure.append(f_time)
+            # f_time 이후의 가장 가까운 recovery_time 찾기
+            rec_after = [r for r in recoveries if r > f_time]
+            if rec_after:
+                r_time = min(rec_after)
+            else:
+                # recovery가 없는 마지막 고장은 데이터 끝까지 제거
+                r_time = merged["timestamp"].max()
+            drop_ranges.append((f_time, r_time))
+        print("[INFO] Excluding failure→recovery intervals:")
+        for f, r in drop_ranges:
+            print(f"  {f}  →  {r}")
+
+        # === merged에서 해당 구간 제거 ===
+        mask = pd.Series(False, index=merged.index)
+        for f, r in drop_ranges:
+            mask |= (merged["timestamp"] >= f) & (merged["timestamp"] < r)
+
+        before = len(merged)
+        merged = merged.loc[~mask].reset_index(drop=True)
+        after = len(merged)
+        print(f"[INFO] Removed {before - after} rows between failure→recovery intervals.")
+
+        # === 이후 failure label 태깅 (회복된 이후 데이터만 포함) ===
+        failure_df = pd.DataFrame({"timestamp": failures})
+        failure_df["label"] = 1
+        merged = pd.merge_asof(
+            merged,
+            failure_df,
+            on="timestamp",
+            direction="forward",
+            tolerance=pd.Timedelta(args.step)
         )
+        slo_df = get_slo_violation_history(args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
+        slo_df["timestamp"] = pd.to_datetime(slo_df["timestamp"]).dt.tz_localize(None)
+        if args.slo_as_input:
+            merged= put_slo_violation_as_input(merged, slo_df, args.step, True)
+        #print(slo_df)
+        else:
+            # Label 병합
+            merged = pd.merge_asof(merged, slo_df, on="timestamp", direction="forward",tolerance=pd.Timedelta(args.step))
+            merged["label"] = (
+                merged.get("label_x", 0).fillna(0).astype(int) |
+                merged.get("label_y", 0).fillna(0).astype(int)
+            )
 
-        merged.drop(columns=[col for col in ["label_x", "label_y"] if col in merged.columns], inplace=True)
+            merged.drop(columns=[col for col in ["label_x", "label_y"] if col in merged.columns], inplace=True)
 
-    print (f'[INFO] Total abnormal row num: {(merged["label"] == 1).sum()}')
-    
-    # feature transform
-    feats = merged.drop(columns=["timestamp", "label"])
-    print(f'[INFO] input data shape: {merged.shape}')
-    failures_df = merged.loc[merged["label"] == 1, ["timestamp"]].copy()
-    failures_df["timestamp"] = pd.to_datetime(failures_df["timestamp"])
-    failures = failures_df["timestamp"].values
-    timestamps = merged["timestamp"].values
-    # Remove features that std=0 to prevetn Loss become 0
-    df_std = feats.std(axis=0)
-    valid_cols = df_std[df_std > 0].index
-    removed_cols = df_std[df_std == 0].index 
-    print("[INFO] Removed columns with std=0:", list(removed_cols))
-    feats = feats[valid_cols]
-    feature_names = list(feats.columns)
-    
-    if args.feature == "diff":
-        feats = feats.diff().fillna(0)
-    elif args.feature == "var":
-        feats = feats.rolling(window=3).var().fillna(0)
-    else:
-        log_recommended_feature_list= analyze_features_cli(feats)
-        for feature_name in log_recommended_feature_list:
-            feats[feature_name] = np.log1p(feats[feature_name])
-    X = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-    y = merged["label"].values
+        print (f'[INFO] Total abnormal row num: {(merged["label"] == 1).sum()}')
+        timestamps = merged.loc[merged["label"] == 1, "timestamp"]
+        # feature transform
+        feats = merged.drop(columns=["timestamp", "label"])
+        print(f'[INFO] input data shape: {merged.shape}')
+        failures = ori_failure
+        timestamps = merged["timestamp"].values
+        # Remove features that std=0 to prevetn Loss become 0
+        df_std = feats.std(axis=0)
+        valid_cols = df_std[df_std > 0].index
+        removed_cols = df_std[df_std == 0].index 
+        print("[INFO] Removed columns with std=0:", list(removed_cols))
+        feats = feats[valid_cols]
+        feature_names = list(feats.columns)
+        
+        if args.feature == "diff":
+            feats = feats.diff().fillna(0)
+        elif args.feature == "var":
+            feats = feats.rolling(window=3).var().fillna(0)
+        else:
+            log_recommended_feature_list= analyze_features_cli(feats)
+            for feature_name in log_recommended_feature_list:
+                feats[feature_name] = np.log1p(feats[feature_name])
+        X = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+        y = merged["label"].values
+        dataset = (X,y, timestamps, failures)
+        with open(file_path, 'wb') as f:
+            pkl.dump(dataset, f)
+        print(f'📁 Datset saved in {file_path}')
     if args.optuna:
         if args.model:
-            study = study_optuna(X, y, timestamps, failures, device, timeout = 30, model_name=args.model)
+            study = study_optuna(X, y, timestamps, failures, device, timeout = 7200, model_name=args.model)
             df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
             df = df[df["state"] == "COMPLETE"]
             best_per_combo = (
@@ -563,7 +570,7 @@ if __name__ == "__main__":
     parser.add_argument("--hor", type=int, default=5)
     parser.add_argument("--train_ratio", type=float, default=0.7)
     parser.add_argument("--batch", type=int, default=64)
-    parser.add_argument("--step", type=str, default='2m', help="step for Prometheus, e.g. 1m, 30s")
+    parser.add_argument("--step", type=str, default='3m', help="step for Prometheus, e.g. 1m, 30s")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--granularity", type=str, choices=["pod", "domain", "pod_avg"], default="pod_avg")
@@ -571,5 +578,6 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=["LSTM", "GRU", "GRU_Att", "CNV_GRU"])
     parser.add_argument("--slo-as-input", action='store_true')
     parser.add_argument("--optuna", action='store_true')
+    parser.add_argument("--use-pickle", action='store_true', help="using saved pickle file. if no, save the data file.")
     args = parser.parse_args()
     main(args)

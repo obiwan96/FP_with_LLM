@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import os
 from functools import partial
 import optuna.visualization as vis
+from optuna.pruners import MedianPruner
 
 # ---------- 모델 정의 ----------
 class LSTMModel(nn.Module):
@@ -130,13 +131,17 @@ def get_cutoff_time_by_failure_ratio(failures, train_ratio=0.8):
     #print(f"[INFO] Train failures: {cutoff_idx + 1}/{len(failures_sorted)} "  f"({(cutoff_idx + 1)/len(failures_sorted):.1%})")
     return cutoff_time
 
-def split_by_cutoff(X_seq, y_seq, ts_seq, cutoff_time):
+def split_by_cutoff(X_seq, y_seq, ts_seq, cutoff_time, put_cutoff_to_train=True):
     """
     cutoff 시점을 기준으로 X/y/timestamp split.
     """
     ts_seq = pd.to_datetime(ts_seq)
-    train_mask = ts_seq <= cutoff_time
-    test_mask = ts_seq > cutoff_time
+    if put_cutoff_to_train:
+        train_mask = ts_seq <= cutoff_time
+        test_mask = ts_seq > cutoff_time
+    else:
+        train_mask = ts_seq < cutoff_time
+        test_mask = ts_seq >= cutoff_time
 
     X_train, X_test = X_seq[train_mask], X_seq[test_mask]
     y_train, y_test = y_seq[train_mask], y_seq[test_mask]
@@ -166,31 +171,31 @@ def make_dataset(X, y, window, horizon):
         ys.append(label)
     return np.array(xs), np.array(ys)
 
-def make_soft_dataset(X, y, timestamps, window, horizon, mode="linear"):
+def make_soft_dataset(X, y, timestamps, window, horizon, smooth_window=3, mode="linear"):
     """
     window/horizon 기반 soft label 데이터셋 생성 + 각 시퀀스의 대표 timestamp 저장
     """
     xs, ys, ts_valid = [], [], []
     N = len(X)
-    for i in range(N - window - horizon):
+    for i in range(N - window - horizon+1):
         x_window = X[i : i + window]
-        future_window = y[i:i + window - 1]
-        if np.any(future_window > 0):
-            continue  # window 내 고장 → skip
+        if horizon > 0:
+            current_y_window = y[i:i + window]
+            if np.any(current_y_window > 0):
+                continue  # if not detection, fault inside window → skip
 
-        future_window = y[i + window - 1 : i + window + horizon - 1]
+        future_window = y[i + window-1: i + window + horizon]
         label = 1 if np.any(future_window > 0) else 0
 
         if not label:
-            future_y = y[i + window + horizon - 1 : i + window + 2 * horizon - 1]
+            future_y = y[i + window + horizon : i + window + horizon + smooth_window]
             if np.any(future_y > 0):
                 dist = np.argmax(future_y > 0)
                 if mode == "linear":
                     #label = max(0.0, 1.0 - dist / horizon)
-                    label = max(0, 1 - dist / (0.5*horizon))
+                    label = max(0, 1 - dist / (smooth_window))
                 elif mode == "exp":
-                    label = np.exp(-dist / (horizon / 2.0))
-
+                    label = np.exp(-dist / (smooth_window))
         xs.append(x_window)
         ys.append(label)
         ts_valid.append(timestamps[i + window + horizon - 1])
@@ -254,15 +259,16 @@ def objective(trial, X_raw, y_raw, timestamps, failures, device, model_name = No
 
     X_seq, y_seq, ts_seq = make_soft_dataset(X_raw, y_raw, timestamps, window, horizon, mode="linear")
 
-    # --- Event-based 3-fold CV ---
+    # --- Event-based 2-fold CV ---
     train_ratio_list = [0.3, 0.7]
     fold_scores = []
     for train_ratio in train_ratio_list:
         cutoff_time = get_cutoff_time_by_failure_ratio(failures, train_ratio)
         if train_ratio == 0.3:
-            X_val, X_tr, y_val, y_tr = split_by_cutoff(X_seq, y_seq, ts_seq, cutoff_time)
+            X_val, X_tr, y_val, y_tr = split_by_cutoff(X_seq, y_seq, ts_seq, cutoff_time, put_cutoff_to_train=False)
         else:
             X_tr, X_val, y_tr, y_val = split_by_cutoff(X_seq, y_seq, ts_seq, cutoff_time)
+        #print(np.unique(y_val, return_counts=True))
         if model_name == "LSTM":
             model = LSTMModel(input_size=X_tr.shape[2],
                               hidden_size=hidden_size,
@@ -292,7 +298,7 @@ def objective(trial, X_raw, y_raw, timestamps, failures, device, model_name = No
         val_loader = DataLoader(TensorDataset(torch.tensor(X_val, dtype=torch.float32),
                                               torch.tensor(y_val, dtype=torch.float32)), batch_size=64, shuffle=False)
         best_f1 = 0
-        for epoch in range(1, 30):
+        for epoch in range(1, 100):
             f1, auc, pr, _ = train_and_eval(model, train_loader, val_loader,
                                             optimizer, criterion, device, scheduler)
             best_f1 = max(best_f1, f1)
@@ -303,9 +309,14 @@ def objective(trial, X_raw, y_raw, timestamps, failures, device, model_name = No
     return score
 
 def study_optuna(X_raw, y_raw, timestamps, failures, device, timeout=None, model_name=None):
-    #sampler = optuna.samplers.TPESampler(seed=42)
-    # No pruner: 성능 지속적으로 낮을 경우 멈춰버리는 pruner을 일단 끔.
-    study = optuna.create_study(direction="maximize")
+    # TPE + Media pruner
+    sampler = optuna.samplers.TPESampler(seed=42)
+    pruner=MedianPruner(
+        n_startup_trials=10,     # 초반 10개 trial은 pruning하지 않음
+        n_warmup_steps=5,       # 최소 5 step 이후부터 pruning 고려
+        interval_steps=1
+    )
+    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
     objective_with_data = partial(
         objective,
         X_raw=X_raw,
@@ -319,14 +330,15 @@ def study_optuna(X_raw, y_raw, timestamps, failures, device, timeout=None, model
     study.optimize(objective_with_data, timeout=timeout)
     print("✅ Best Params:", study.best_params)
     print("✅ Best Composite Score:", study.best_value)
-    fig1 = vis.plot_optimization_history(study)
-    fig1.write_html("tmp/optuna/optuna_optimization_history.html")
+    if len(study.trials) > 1:
+        fig1 = vis.plot_optimization_history(study)
+        fig1.write_html("tmp/optuna/optuna_optimization_history.html")
 
-    fig2 = vis.plot_param_importances(study)
-    fig2.write_html("tmp/optuna/optuna_param_importances.html")
+        fig2 = vis.plot_param_importances(study)
+        fig2.write_html("tmp/optuna/optuna_param_importances.html")
 
-    fig3 = vis.plot_parallel_coordinate(study)
-    fig3.write_html("tmp/optuna/optuna_parallel_coordinate.html")
+        fig3 = vis.plot_parallel_coordinate(study)
+        fig3.write_html("tmp/optuna/optuna_parallel_coordinate.html")
     return study
 
 def analyze_features_cli(X, feature_names=None, output_dir="tmp/", skew_threshold=10):

@@ -254,7 +254,7 @@ def main(args):
     }
     shap_right_num=0
     llm_list = ['deepseek-r1:14b', 'gpt-oss:20b', 'gemma3:27b']
-    log_file_path = 'tmp/fault_pod_logs_45min.pkl'
+    log_file_path = 'tmp/fault_pod_logs.pkl'
     with open(log_file_path, 'rb') as f:
         log_data = pkl.load(f)
     llm_try_num=0
@@ -288,8 +288,8 @@ def main(args):
             if abs(datetime.strptime(single_log[0], '%Y-%m-%d %H:%M:%S') - failure_situation['failure_time']) < timedelta(minutes=3):
                 # it's same fault situation!
                 print(f'find {single_log[1].upper()} error log in log data')
-                log_data = single_log[2]
-                filtered_logs = [entry["log"] for entry in log_data if start_time <= entry["timestamp"] <= end_time]
+                find_log_data = single_log[2]
+                filtered_logs = [entry["log"] for entry in find_log_data if start_time <= entry["timestamp"] <= end_time]
                 error_filtered_logs= filter_error_logs(filtered_logs)
                 print('[INFO] filterd logs:')
                 combined_logs = "\n".join(error_filtered_logs)
@@ -313,6 +313,7 @@ def main(args):
                     print('********************')
                     print(f'[LLM {llm} response]')
                     print(remedy)
+                break
 
     print(f'\n[RESULT] SHAP find right answer with {shap_right_num/len(results)*100}% of accuracy')
 if __name__ == '__main__':

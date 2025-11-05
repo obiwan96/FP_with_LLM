@@ -271,7 +271,7 @@ class LokiClient:
             "direction": direction,
         }
         try:
-            response = requests.get(f"{self.base_url}/loki/api/v1/query_range", params=params)
+            response = requests.get(f"{self.base_url}/loki/api/v1/query_range", params=params, timeout=30)
             response.raise_for_status()
         except:
             #loki busy..
@@ -293,9 +293,14 @@ class LokiClient:
                 container_set.add(container)
         return list(container_set)
 
-    def get_recent_logs(self, namespace: str, container: str=None, limit: int = 3000, window: int=5):
-        now = now_ns()
-        start = now_ns(minutes(-window))
+    def get_recent_logs(self, namespace: str, end_time:datetime=None, container: str=None, limit: int = 3000, window: int=5):
+        if end_time:
+            now = int(end_time.timestamp() * 1_000_000_000)
+            start_time= end_time-timedelta(minutes=window)
+            start= int(start_time.timestamp() * 1_000_000_000)
+        else:
+            now = now_ns()
+            start = now_ns(minutes(-window))
         if container:
             logql = f'{{namespace="{namespace}", container="{container}"}}'
         else:
