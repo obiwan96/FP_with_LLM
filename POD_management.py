@@ -192,10 +192,10 @@ def check_core_function_alive(window: int=5):
                 for known_error in known_error_logs:
                     if known_error in single_log['log']:
                         is_known_error=True
-                        print (f'Known error occured in {single_log["container"]}! :{known_error}')
+                        print (f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}:Known error occured in {single_log["container"]}! :{known_error}')
                         return True, False # Known error trigger
                 if not is_known_error:
-                    print(f"error occured in {single_log['container']}! :{single_log['log']}")
+                    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:error occured in {single_log['container']}! :{single_log['log']}")
                     with open(error_logs_file, 'a') as f:
                         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {single_log['container']} : {single_log['log']}\n")
                     # Send telegram message to me if error occur!
@@ -205,6 +205,9 @@ def check_core_function_alive(window: int=5):
                     return True, single_log['container']
     restart_check_result =check_restart(window)
     if restart_check_result:
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:Pod {single_log['container']} Restarted!")
+        with open(error_logs_file, 'a') as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: Pod {single_log['container']} Restarted\n")
         error_alert_body['text'] = f"{restart_check_result} pod restarted!"
         requests.post(error_alert_info['url'], json=error_alert_body,headers=error_alert_info['headers'])
         save_recent_logs(loki, restart_check_result)
@@ -222,6 +225,7 @@ def save_recent_logs(loki_client, container_name, window=45):
     old_logs.append((datetime.now().strftime('%Y-%m-%d %H:%M:%S'),container_name, recent_logs))
     with open(fine_name, "wb") as f:
         pkl.dump(old_logs, f)
+    print('[INFO] error logs dumped in fault_pod_logs pickle file')
 
 # ------------------------------
 # K8s Pod 대기 & Exec
@@ -377,7 +381,7 @@ def main():
         if args.soft:
             time.sleep(random.randrange(30*6,30*8))
         else:
-            time.sleep(random.randrange(10,25))
+            time.sleep(random.randrange(5,15))
 
 def run_cmd(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     logging.debug("RUN: %s", " ".join(shlex.quote(c) for c in cmd))

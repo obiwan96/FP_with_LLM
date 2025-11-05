@@ -1,8 +1,7 @@
 import os, json, time, requests, torch
-from secret import ollama_ip, loki_ip, InDB_info
+from secret import ollama_ip
 import numpy as np, pandas as pd
 from datetime import datetime, timedelta
-from sklearn.metrics import classification_report
 import joblib
 import argparse
 import shap
@@ -12,6 +11,7 @@ from InDB_helper import *
 from Prome_helper import *
 from failure_prediction import get_merged_data, get_slo_violation_history, put_slo_violation_as_input, get_failure_and_recovery
 from torch import nn
+import pickle as pkl
 
 def find_best_model(model_name, base_dir="tmp/models", restrict_file_path=None):
     # f1 점수가 정수형일 때 (예: 91)
@@ -57,6 +57,36 @@ class WrappedModel(nn.Module):
         if out.dim() == 1:  # (batch,) 형태라면
             out = out.unsqueeze(-1)
         return out
+
+def call_ollama(prompt: str, model, max_tokens=800, temperature=0.2):
+    payload = {"model": model, "prompt": prompt, "stream": False, "options":{"num_predict": max_tokens, "temperature": temperature}}
+    r = requests.post(ollama_ip, json=payload); r.raise_for_status()
+    return r.json().get("response","")
+
+def remove_timestamp_and_ueid_from_log(log):
+    # 시각 정보 제거 (형식: [YYYY-MM-DD HH:MM:SS.sss])
+    log = re.sub(r'\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]', '', log)    
+    # UE Id 정보 제거 (형식: [UE Id <id>])
+    log = re.sub(r'\[UE Id [^\]]+\]', '', log)
+    
+    return log
+
+def filter_error_logs(filtered_logs, error_filter_window=2):
+    error_words = ['error', 'critical', 'fatal', 'warning']
+    error_filtered_logs = []
+    error_filterd_index=[]
+    for i, log in enumerate(filtered_logs):
+        if any(error_word in log for error_word in error_words):
+            start_index = max(0, i - error_filter_window) 
+            end_index = min(len(filtered_logs), i + error_filter_window+1)
+            error_filterd_index.extend(range(start_index,end_index))
+    error_filterd_index.sort()
+    error_filterd_index = set(error_filterd_index)
+    for index in error_filterd_index:
+        parsed_log=json.loads(filtered_logs[index])
+        core_log=parsed_log.get("log", "")
+        error_filtered_logs.append(remove_timestamp_and_ueid_from_log(core_log))
+    return error_filtered_logs
 
 def main(args):
     step_size = 2
@@ -123,9 +153,8 @@ def main(args):
     print(f'[INFO] using model from {best_model}')
     NS = "oai"; SMF_CONTAINER = "smf"  # 필요시 바꿔쓰기
 
-    TOPK = 8      # SHAP 상위 피처 개수
+    TOPK = 20      # SHAP 상위 피처 개수
     TOLERANCE_S = 30
-    llm_list = ['deepseek-r1:14b', 'gpt-oss:latest',  'gemma3:27b']
 
     # 준비물 로딩
     scaler = joblib.load(SCALER_PATH)
@@ -208,93 +237,91 @@ def main(args):
 
             results.append({
                 "failure_time": fail_time,
+                "data_start_time": start_time,
+                "data_end_time": end_time,
                 "pred": pred,
                 "container" : container,
                 "top_features": shap_importance[:TOPK]
             })
 
+    nf_list = ['upf', 'amf', 'ausf', 'lmf', 'nrf', 'smf', 'udm', 'udr', 'gnb']
+    metric_nf_dict = {
+        'rrc_state_counts': ['gnb'],
+        'ue_failure_counts': ['gnb', 'amf', 'ausf'],
+        'pdu_session_delay_seconds' : ['smf', 'amf'],
+        'amf_registration_rate' : ['amf', 'ausf'],
+        'smf_session_drop': ['smf']
+    }
+    shap_right_num=0
+    llm_list = ['deepseek-r1:14b', 'gpt-oss:20b', 'gemma3:27b']
+    log_file_path = 'tmp/fault_pod_logs_45min.pkl'
+    with open(log_file_path, 'rb') as f:
+        log_data = pkl.load(f)
+    llm_try_num=0
+    llm_right_num={llm:0 for llm in llm_list}
+    for failure_situation in results:
+        # SHAP test
+        nf_abnormal_score = {nf:0 for nf in nf_list}
+        for feature, shap_val in failure_situation['top_features']:
+            if feature in metric_nf_dict:
+                for nf in metric_nf_dict[feature]:
+                    nf_abnormal_score[nf]+= shap_val
+            else:
+                for nf in nf_list:
+                    if nf in feature:
+                        nf_abnormal_score[nf]+=shap_val
+                        break
+        print(nf_abnormal_score)
+        prediction = max(nf_abnormal_score, key=nf_abnormal_score.get)
+        ground_truth= failure_situation['container']
+        if ground_truth == 'gnodeb':
+            ground_truth = 'gnb'
+        print(f'with SHAP, we think NF {prediction.upper()} will be faield.')
+        print(f"and the ground truth is {ground_truth.upper()}")
+        if prediction == ground_truth:
+            shap_right_num+=1
+        
+        # LLM test
+        start_time= failure_situation['data_start_time']
+        end_time = failure_situation['data_end_time']
+        for single_log in log_data:
+            if abs(datetime.strptime(single_log[0], '%Y-%m-%d %H:%M:%S') - failure_situation['failure_time']) < timedelta(minutes=3):
+                # it's same fault situation!
+                print(f'find {single_log[1].upper()} error log in log data')
+                log_data = single_log[2]
+                filtered_logs = [entry["log"] for entry in log_data if start_time <= entry["timestamp"] <= end_time]
+                error_filtered_logs= filter_error_logs(filtered_logs)
+                print('[INFO] filterd logs:')
+                combined_logs = "\n".join(error_filtered_logs)
+                print(combined_logs)
+                feat_text = "\n".join([f"- {k}: {v:.4f}" for k,v in failure_situation["top_features"][:5]])
+                prompt = f"""
+                    You are an expert SRE for 5G core/cloud-native systems. A time-series ML model predicted an imminent FAILURE in {single_log[1].upper()}.
 
-    # ==== 5) ‘어떤 pod’ 문제인지 추론 ====
-    # 전제: feature 이름에 pod가 들어있다면(예: 'container_cpu_usage_seconds_total{pod=...}')
-    def extract_pod_from_feat(name: str):
-        # 예: container_cpu...{pod="oai-upf-xxx", ...}
-        if "pod=" in name:
-            s = name.split("pod=")[1]
-            # 따옴표/괄호 정리
-            s = s.split(",")[0].split("}")[0].strip('"{} ')
-            return s
-        return None
+                    Top SHAP features contributing to failure:
+                    {feat_text}
 
-    pod_votes = []
-    for feat in top_feats.index:
-        pod = extract_pod_from_feat(feat)
-        if pod: pod_votes.append(pod)
-    pod_rank = pd.Series(pod_votes).value_counts() if pod_votes else pd.Series(dtype=int)
-    suspect_pod = pod_rank.index[0] if not pod_rank.empty else None
-    print("\n[Suspect pod by SHAP feature names]:", suspect_pod)
+                    Recent logs ( Loki):
+                    {combined_logs[-100:]}
 
-    # ==== 6) 해당 pod의 로그를 Loki에서 조회 (예측된 고장 샘플 중 첫 번째 시점 기준, ±5분) ====
-    def query_loki(ns, container=None, pod=None, q="|= \"error\" |= \"drop\" |= \"timeout\"", center_ts=None, minutes=5, limit=2000):
-        if center_ts is None:
-            center_ts = datetime.utcnow()
-        start = int((center_ts - timedelta(minutes=minutes)).timestamp() * 1e9)
-        end   = int((center_ts + timedelta(minutes=minutes)).timestamp() * 1e9)
-        sel = f'{{namespace="{ns}"'
-        if container: sel += f', container="{container}"'
-        if pod: sel += f', pod="{pod}"'
-        sel += "}"
-        params = {"query": f'{sel} {q}', "start": start, "end": end, "direction":"FORWARD", "limit": limit}
-        r = requests.get(LOKI_URL, params=params); r.raise_for_status()
-        out=[]
-        for s in r.json().get("data",{}).get("result",[]):
-            for ts, line in s["values"]:
-                out.append(f'{datetime.fromtimestamp(int(ts)/1e9).isoformat()} {line.strip()}')
-        return out[:200]
+                    Task:
+                    1) Diagnose the most likely root cause.
+                    2) Propose concrete remediation steps (ordered, with commands/config hints).
+                    """
+                for llm in llm_list:
+                    remedy = call_ollama(prompt, llm)
+                    print('********************')
+                    print(f'[LLM {llm} response]')
+                    print(remedy)
 
-    center_time = pd.to_datetime(ts_test.iloc[fail_idx[0]])
-    logs = query_loki(NS, pod=suspect_pod, q='|~ "(?i)error|drop|timeout|pfcp|5xx|oom"', center_ts=center_time, minutes=5)
-
-    # ==== 7) Ollama LLM에 SHAP+로그를 넣어 “조치안” 질의 ====
-    def call_ollama(prompt: str, model=LLM_MODEL, max_tokens=800, temperature=0.2):
-        payload = {"model": model, "prompt": prompt, "stream": False, "options":{"num_predict": max_tokens, "temperature": temperature}}
-        r = requests.post(OLLAMA_URL, json=payload); r.raise_for_status()
-        return r.json().get("response","")
-
-    # 프롬프트 구성 (요약해서 전달)
-    feat_text = "\n".join([f"- {k}: {v:.4f}" for k,v in top_feats.items()])
-    log_text  = "\n".join(logs[:60])  # 너무 길면 60줄 제한
-    sus_line  = f"Suspect pod: {suspect_pod or 'UNKNOWN'}"
-
-    prompt = f"""
-    You are an expert SRE for 5G core/cloud-native systems. A time-series ML model predicted an imminent FAILURE.
-
-    Context:
-    - {sus_line}
-    - Time window center: {center_time.isoformat()}
-
-    Top SHAP features contributing to failure:
-    {feat_text}
-
-    Recent logs (OAI SMF/UPF/AMF, Loki, ±5min):
-    {log_text}
-
-    Task:
-    1) Diagnose the most likely root cause.
-    2) Propose concrete remediation steps (ordered, with commands/config hints).
-    3) List metrics/logs to watch to confirm recovery.
-    Reply in Korean.
-    """
-
-    remedy = call_ollama(prompt)
-    print("\n[LLM REMEDIATION SUGGESTION]\n", remedy)
-
+    print(f'\n[RESULT] SHAP find right answer with {shap_right_num/len(results)*100}% of accuracy')
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=["LSTM", "GRU", "GRU_Att", "CNV_GRU"], default='CNV_GRU')
     parser.add_argument("--start", type=str, default="2025-10-14T10:00:00Z")
     parser.add_argument("--end", type=str)
     parser.add_argument("--feature", type=str, choices=["raw", "diff", "var"], default="raw")
-    parser.add_argument("--granularity", type=str, choices=["pod", "domain", "pod_avg"], default="pod_avg")
+    parser.add_argument("--granularity", type=str, choices=["pod", "domain", "pod_avg"], default="pod")
     parser.add_argument("--restrict", type=str)
     args = parser.parse_args()
     main(args)

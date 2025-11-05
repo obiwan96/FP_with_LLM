@@ -293,7 +293,7 @@ class LokiClient:
                 container_set.add(container)
         return list(container_set)
 
-    def get_recent_logs(self, namespace: str, container: str=None, limit: int = 2000, window: int=5):
+    def get_recent_logs(self, namespace: str, container: str=None, limit: int = 3000, window: int=5):
         now = now_ns()
         start = now_ns(minutes(-window))
         if container:
