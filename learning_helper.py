@@ -240,8 +240,14 @@ def train_and_eval(model, train_loader, val_loader, optimizer, criterion, device
     best_idx = np.argmax(f1s)
     best_th = ths[best_idx]
     f1_best = f1s[best_idx]
-    roc = roc_auc_score((trues > 0.5).astype(int), preds)
-    pr = average_precision_score((trues > 0.5).astype(int), preds)
+    try:
+        roc = roc_auc_score((trues > 0.5).astype(int), preds)
+        pr = average_precision_score((trues > 0.5).astype(int), preds)
+    except Exception as E:
+        roc = pr = 0
+        print (f'[ERROR] exception ccured in roc, precision score. {E}')
+        print(np.unique(trues, return_counts=True))
+
     return f1_best, roc, pr, best_th
 
 # ✅ Optuna objective

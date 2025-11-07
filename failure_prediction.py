@@ -227,10 +227,22 @@ def get_prometheus_data(start, end, step, granularity):
     #print(merged.columns)
     return merged
 
-def get_merged_data(start, end, step, granularity):
+def get_merged_data(start, end, step, granularity, single_domain=None, resource_only=False):
     merged = get_prometheus_data(start, end,step, granularity)
-    influx_df = get_influx_metrics(start, end)
-
+    if resource_only:
+        influx_df = pd.DataFrame(columns=["timestamp"])
+    else:
+        influx_df = get_influx_metrics(start, end)
+    if single_domain:
+        if single_domain=='ran':
+            use_metric_list = ['rrc_state_counts', 'ue_failure_counts']
+            nf_list = ['gnb']
+        elif single_domain=='core':
+            use_metric_list = ["pdu_session_delay_seconds", "amf_registration_rate", "upf_throughput", "smf_session_drop"]
+            nf_list = ['amf', 'ausf', 'lmf', 'nrf', 'smf', 'udm', 'udr', 'upf']
+        #print(merged.columns)
+        merged = merged[['timestamp'] + [col for col in merged.columns if any(nf in col for nf in nf_list)]]
+        influx_df = influx_df[['timestamp'] + [col for col in influx_df.columns if col in use_metric_list]]
     # Timestamp 정렬 및 병합
     influx_df = influx_df.sort_values("timestamp")
     merged["timestamp"] = pd.to_datetime(merged["timestamp"]).dt.tz_localize(None)
@@ -244,9 +256,9 @@ def get_merged_data(start, end, step, granularity):
 # ---------- 메인 ----------
 def main(args):
     print(f"\n[INFO] Starting training with model={args.model}, granularity={args.granularity}, feature={args.feature}\n")
-    file_path = f"tmp/data/{args.feature}_{args.granularity}_{'sloasinput' if args.slo_as_input else ''}_stepsize{args.step}.pkl"
+    file_path = f"tmp/data/{args.single_domain}{'resource' if args.resource_only else 'mdaf'}{args.feature}_{args.granularity}_{'sloasinput' if args.slo_as_input else ''}_stepsize{args.step}.pkl"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-   
+    
     if args.use_pickle:
         with open(file_path, 'rb') as f:
             dataset= pkl.load(f)
@@ -261,15 +273,23 @@ def main(args):
         
         
         # Read X data
-        merged = get_merged_data(start, end, args.step, args.granularity)
+        merged = get_merged_data(start, end, args.step, 
+                                 args.granularity, single_domain=args.single_domain, resource_only=args.resource_only)
 
         # === 고장/회복 데이터 읽기 ===
         events_df = get_failure_and_recovery(start, end)
 
         # === failure-recovery 구간 식별 ===
-        failures = events_df[events_df["type"] == "failure"]["timestamp"].tolist()
+        failures = events_df[events_df["type"] == "failure"]
+        if args.single_domain:
+            if args.single_domain=='ran':
+                nf_list = ['gnb', 'gnodeb']
+            elif args.single_domain=='core':
+                nf_list = ['amf', 'ausf', 'lmf', 'nrf', 'smf', 'udm', 'udr', 'upf']
+            failures = failures[failures['label'].isin(nf_list)].reset_index(drop=True)
+        failures = failures["timestamp"].tolist()
         recoveries = events_df[events_df["type"] == "recovery"]["timestamp"].tolist()
-
+        
         # recovery가 없을 경우 대비
         if not failures:
             print("[INFO] No failure events found.")
@@ -319,7 +339,8 @@ def main(args):
         slo_df = get_slo_violation_history(args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
         slo_df["timestamp"] = pd.to_datetime(slo_df["timestamp"]).dt.tz_localize(None)
         if args.slo_as_input:
-            merged= put_slo_violation_as_input(merged, slo_df, args.step, True)
+            if not args.single_domain == 'core' and not args.resource_only:
+                merged= put_slo_violation_as_input(merged, slo_df, args.step, True)
         #print(slo_df)
         else:
             # Label 병합
@@ -362,7 +383,7 @@ def main(args):
         print(f'📁 Datset saved in {file_path}')
     if args.optuna:
         if args.model:
-            study = study_optuna(X, y, timestamps, failures, device, timeout = 7200, model_name=args.model)
+            study = study_optuna(X, y, timestamps, failures, device, timeout = args.optuna*60*60, model_name=args.model)
             df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
             df = df[df["state"] == "COMPLETE"]
             best_per_combo = (
@@ -408,13 +429,14 @@ def main(args):
     else:
         X_seq, y_seq, ts_seq = make_soft_dataset(X, y, timestamps, args.win, args.hor, mode="linear")
         if args.model == 'LSTM':
-            model = LSTMModel(input_size=X_seq.shape[2]).to(device)
+            model = LSTMModel(input_size=X_seq.shape[2])
         elif args.model == 'GRU':
-            model = GRUModel(input_size=X_seq.shape[2]).to(device)
+            model = GRUModel(input_size=X_seq.shape[2])
         elif args.model == 'GRU_Att':
-            model = GRUWithAttention(input_size=X_seq.shape[2]).to(device)
+            model = GRUWithAttention(input_size=X_seq.shape[2])
         else: # CNV_GRU
-            model = ConvGRU(input_size=X_seq.shape[2]).to(device)
+            model = ConvGRU(input_size=X_seq.shape[2])
+        model.to(device)
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=5, verbose=True
@@ -573,11 +595,13 @@ if __name__ == "__main__":
     parser.add_argument("--step", type=str, default='3m', help="step for Prometheus, e.g. 1m, 30s")
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--granularity", type=str, choices=["pod", "domain", "pod_avg"], default="pod_avg")
+    parser.add_argument("--granularity", type=str, choices=["pod", "domain", "pod_avg"], default="pod")
     parser.add_argument("--feature", type=str, choices=["raw", "diff", "var"], default="raw")
     parser.add_argument("--model", type=str, choices=["LSTM", "GRU", "GRU_Att", "CNV_GRU"])
     parser.add_argument("--slo-as-input", action='store_true')
-    parser.add_argument("--optuna", action='store_true')
+    parser.add_argument("--optuna", type=int, help='To use Optuna, put limit ime as hours.')
     parser.add_argument("--use-pickle", action='store_true', help="using saved pickle file. if no, save the data file.")
+    parser.add_argument("--single-domain", type=str, choices=["ran", "core"])
+    parser.add_argument("--resource-only", action='store_true')
     args = parser.parse_args()
     main(args)

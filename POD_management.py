@@ -205,9 +205,9 @@ def check_core_function_alive(window: int=5):
                     return True, single_log['container']
     restart_check_result =check_restart(window)
     if restart_check_result:
-        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:Pod {single_log['container']} Restarted!")
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}:Pod {restart_check_result} Restarted!")
         with open(error_logs_file, 'a') as f:
-            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: Pod {single_log['container']} Restarted\n")
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: Pod {restart_check_result} Restarted\n")
         error_alert_body['text'] = f"{restart_check_result} pod restarted!"
         requests.post(error_alert_info['url'], json=error_alert_body,headers=error_alert_info['headers'])
         save_recent_logs(loki, restart_check_result)

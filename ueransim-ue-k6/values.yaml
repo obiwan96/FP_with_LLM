@@ -20,7 +20,7 @@
   'debug': !!bool 'false'
 'name': 'ueransim-ue'
 'count': !!int '1'
-'initialMSISDN': '0000000122'
+'initialMSISDN': '0000000136'
 'mcc': '001'
 'mnc': '01'
 'key': 'fec86ba6eb707ed08905757b1bb44b8f'
