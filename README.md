@@ -38,7 +38,7 @@ The framework collects resource and log metrics from all domains, stores them in
       [ML & XAI Analysis Layer]
         ├─ failure_prediction.py
         ├─ learning_helper.py
-        └─ SHAP + LLM reasoning
+        └─ XAI.py
 ```
 ---
 
@@ -51,6 +51,7 @@ The framework collects resource and log metrics from all domains, stores them in
 | `Prome_helper.py` | Interfaces with **Prometheus** and **InfluxDB**, collects resource metrics and logs from RAN/Core/Application domains. *(Acts as the MDAF Collector)* |
 | `learning_helper.py` | Provides helper functions for dataset preprocessing, normalization, and model training utilities. |
 | `failure_prediction.py` | Runs the core **failure prediction experiments**, loads data from InfluxDB, trains ML models (LSTM, GRU, CNV-GRU, Attention-GRU), and evaluates results. |
+| `XAI.py` | Explain the prediction results and suggest the solution based on **SHAP+LLM**. |
 | `README.md` | Project documentation. |
 
 ---
@@ -110,7 +111,7 @@ This repository assumes a pre-deployed **5G/6G testbed** with the following comp
 
 1. Perform SHAP + LLM-based explanation:
     ```bash
-    python3 explain_with_llm.py
+    python3 XAI.py
     ```
 ## 🧠 Explainable AI Integration
 
