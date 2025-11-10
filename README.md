@@ -26,13 +26,15 @@ The framework collects resource and log metrics from all domains, stores them in
                 │
                 ▼
         [Kubernetes Pods]
+        └─ POD_management.py
                 │
                 ▼
         Prometheus & Loki
+        └─ Prome_helper.py
                 │
                 ▼
        [MDAF Collector Layer]
-        └─ Prome_helper.py → InfluxDB
+        └─ MDAF_Collector.py → InfluxDB
                 │
                 ▼
       [ML & XAI Analysis Layer]
@@ -47,11 +49,13 @@ The framework collects resource and log metrics from all domains, stores them in
 | File | Description |
 |------|--------------|
 | `secret.py` | Contains configuration and authentication details for communication with the testbed (Prometheus, Loki, InfluxDB, Kubernetes API, etc.). Users should fill in their own credentials and endpoints. |
-| `POD_management.py` | Handles creation, deployment, and lifecycle management of **UE Pods** in the Kubernetes cluster. |
-| `Prome_helper.py` | Interfaces with **Prometheus** and **InfluxDB**, collects resource metrics and logs from RAN/Core/Application domains. *(Acts as the MDAF Collector)* |
+| `slo-violation-check-ue` | Contains python and dockerfile for *(SLO Violation Check UE)* |
+| `POD_management.py` | Handles creation, deployment, and lifecycle management of **UE Pods** in the Kubernetes cluster. *(UE Manager)* |
+| `Prome_helper.py` | Libraries to handle with  **Prometheus** and **InfluxDB**. |
+| `MDAF_Collector.py` | Interfaces with **Prometheus** and **InfluxDB**, collects resource metrics and logs from RAN/Core/Application domains. *(Acts as the MDAF Collector)* |
 | `learning_helper.py` | Provides helper functions for dataset preprocessing, normalization, and model training utilities. |
-| `failure_prediction.py` | Runs the core **failure prediction experiments**, loads data from InfluxDB, trains ML models (LSTM, GRU, CNV-GRU, Attention-GRU), and evaluates results. |
-| `XAI.py` | Explain the prediction results and suggest the solution based on **SHAP+LLM**. |
+| `failure_prediction.py` | Runs the core **failure prediction experiments**, loads data from InfluxDB, trains ML models (LSTM, GRU, CNV-GRU, Attention-GRU), and evaluates results. *(MDAF-AI-Analyzer: Fault Prediction Module)*|
+| `XAI.py` | Explain the prediction results and suggest the solution based on **SHAP+LLM**. *(MDAF-AI-Analyzer: Root Cause Analysis Module)*|
 | `README.md` | Project documentation. |
 
 ---

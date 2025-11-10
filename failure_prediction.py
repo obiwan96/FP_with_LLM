@@ -1,7 +1,7 @@
 import argparse
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from influxdb_client import InfluxDBClient
 from Prome_helper import PrometheusClient, to_rfc3339
 from sklearn.preprocessing import StandardScaler

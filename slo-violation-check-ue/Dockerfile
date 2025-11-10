@@ -12,10 +12,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 애플리케이션 복사
-COPY fault_detector.py .
+COPY slo-violation-check.py .
 
 # 실행 유저 전환
 USER obiwan
 
 # 기본 실행 커맨드
-CMD ["python", "fault_detector.py"]
+CMD ["python", "slo-violation-check"]
