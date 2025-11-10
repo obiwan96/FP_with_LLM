@@ -18,4 +18,4 @@ COPY slo-violation-check.py .
 USER obiwan
 
 # 기본 실행 커맨드
-CMD ["python", "slo-violation-check"]
+CMD ["python", "slo-violation-check.py"]

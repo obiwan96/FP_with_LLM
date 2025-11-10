@@ -26,15 +26,15 @@ The framework collects resource and log metrics from all domains, stores them in
                 │
                 ▼
         [Kubernetes Pods]
-        └─ POD_management.py
+          └─ POD_management.py
                 │
                 ▼
         Prometheus & Loki
-        └─ Prome_helper.py
+          └─ Prome_helper.py
                 │
                 ▼
        [MDAF Collector Layer]
-        └─ MDAF_Collector.py → InfluxDB
+         └─ MDAF_Collector.py → InfluxDB
                 │
                 ▼
       [ML & XAI Analysis Layer]
@@ -49,7 +49,7 @@ The framework collects resource and log metrics from all domains, stores them in
 | File | Description |
 |------|--------------|
 | `secret.py` | Contains configuration and authentication details for communication with the testbed (Prometheus, Loki, InfluxDB, Kubernetes API, etc.). Users should fill in their own credentials and endpoints. |
-| `slo-violation-check-ue` | Contains python and dockerfile for *(SLO Violation Check UE)* |
+| `slo-violation-check-ue` /| Contains python and dockerfile for *(SLO Violation Check UE)* |
 | `POD_management.py` | Handles creation, deployment, and lifecycle management of **UE Pods** in the Kubernetes cluster. *(UE Manager)* |
 | `Prome_helper.py` | Libraries to handle with  **Prometheus** and **InfluxDB**. |
 | `MDAF_Collector.py` | Interfaces with **Prometheus** and **InfluxDB**, collects resource metrics and logs from RAN/Core/Application domains. *(Acts as the MDAF Collector)* |
@@ -105,7 +105,7 @@ This repository assumes a pre-deployed **5G/6G testbed** with the following comp
 
 1. Run data collector (MDAF-Collector)
     ```bash
-    python3 Prome_helper.py
+    python3 MDAF_Collector.py
     ```
 
 1. Run failure prediction experiments
