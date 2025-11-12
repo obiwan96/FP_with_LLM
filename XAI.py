@@ -90,6 +90,8 @@ def filter_error_logs(filtered_logs, error_filter_window=2):
 
 def main(args):
     step_size = 2
+    xai_result_path='tmp/xai_results.txt'
+    FEAT_PATH   = "feature_names.csv"
 
     # Read fault history based on end, start date
     if args.end is not None:
@@ -101,14 +103,8 @@ def main(args):
     slo_df = get_slo_violation_history(args.start, datetime.now(timezone.utc).isoformat()).sort_values("timestamp")
     slo_df["timestamp"] = pd.to_datetime(slo_df["timestamp"]).dt.tz_localize(None)
     events_df= put_slo_violation_as_input(events_df, slo_df, str(f'{step_size}m')) # use slo_violation as input!
-
-    # remove column that std is 0, use log to some column
-    df_std = events_df.drop(columns=['timestamp']).std(axis=0)
-    valid_cols = df_std[df_std > 0].index
-    removed_cols = df_std[df_std == 0].index
-    print("[INFO] Removed columns with std=0:", list(removed_cols))
-    feature_names = list(events_df[list(valid_cols)].columns)
-    events_df = events_df[['timestamp'] + list(valid_cols)]
+    feature_names = pd.read_csv(FEAT_PATH, header=None)[0].tolist()[1:]
+    #events_df = events_df[[col for col in events_df.columns if col in feature_names]]
     num_cols = events_df.columns.difference(['timestamp'])
     feature_df = events_df[num_cols]
     if args.feature == "diff":
@@ -117,8 +113,8 @@ def main(args):
         events_df[num_cols] = events_df[num_cols].rolling(window=3).var().fillna(0)
     else:
         log_recommended_feature_list= analyze_features_cli(feature_df)
-        for feature_name in log_recommended_feature_list:
-            events_df[feature_name] = np.log1p(events_df[feature_name])
+        for single_feature_name in log_recommended_feature_list:
+            events_df[single_feature_name] = np.log1p(events_df[single_feature_name])
 
     #get failure time stamp list
     failures_recoveries_df = get_failure_and_recovery(start, end)
@@ -148,17 +144,14 @@ def main(args):
     horizon = best_model_info['horizon']
     f1 = best_model_info['f1']
     SCALER_PATH = f"tmp/models/{args.model}_model_win{window}_hor{horizon}_{f1}_scaler.joblib"
-    FEAT_PATH   = "feature_names.csv"
     BG_PATH     = f"tmp/models/{args.model}_model_win{window}_hor{horizon}_{f1}_bg_samples.npy"
     print(f'[INFO] using model from {best_model}')
-    NS = "oai"; SMF_CONTAINER = "smf"  # 필요시 바꿔쓰기
 
     TOPK = 20      # SHAP 상위 피처 개수
     TOLERANCE_S = 30
 
     # 준비물 로딩
     scaler = joblib.load(SCALER_PATH)
-    #feature_names = pd.read_csv(FEAT_PATH, header=None)[0].tolist()
     input_size = len(feature_names)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.model == 'LSTM':
@@ -288,6 +281,8 @@ def main(args):
             if abs(datetime.strptime(single_log[0], '%Y-%m-%d %H:%M:%S') - failure_situation['failure_time']) < timedelta(minutes=3):
                 # it's same fault situation!
                 print(f'find {single_log[1].upper()} error log in log data')
+                with open (xai_result_path, 'a') as f:
+                    f.write(f'Find {single_log[1].upper()} error at {single_log[0]}')
                 find_log_data = single_log[2]
                 filtered_logs = [entry["log"] for entry in find_log_data if start_time <= entry["timestamp"] <= end_time]
                 error_filtered_logs= filter_error_logs(filtered_logs)
@@ -296,23 +291,28 @@ def main(args):
                 print(combined_logs)
                 feat_text = "\n".join([f"- {k}: {v:.4f}" for k,v in failure_situation["top_features"][:5]])
                 prompt = f"""
-                    You are an expert SRE for 5G core/cloud-native systems. A time-series ML model predicted an imminent FAILURE in {single_log[1].upper()}.
+                    You are an expert SRE for 5G core/cloud-native systems. 
+                    A time-series ML model predicted an imminent FAILURE in {single_log[1].upper()}.
 
                     Top SHAP features contributing to failure:
                     {feat_text}
 
-                    Recent logs ( Loki):
+                    Recent logs from {single_log[1].upper()}:
                     {combined_logs[-100:]}
 
                     Task:
-                    1) Diagnose the most likely root cause.
+                    1) Diagnose the only one most likely root cause.
                     2) Propose concrete remediation steps (ordered, with commands/config hints).
+                    3) SHAP results may not be highly accurate. Just refer it and make a diagnosis based on log.
                     """
                 for llm in llm_list:
                     remedy = call_ollama(prompt, llm)
                     print('********************')
                     print(f'[LLM {llm} response]')
                     print(remedy)
+                    with open (xai_result_path, 'a') as f:
+                        f.write('LLM: '+ llm)
+                        f.write(remedy)
                 break
 
     print(f'\n[RESULT] SHAP find right answer with {shap_right_num/len(results)*100}% of accuracy')
@@ -323,6 +323,6 @@ if __name__ == '__main__':
     parser.add_argument("--end", type=str)
     parser.add_argument("--feature", type=str, choices=["raw", "diff", "var"], default="raw")
     parser.add_argument("--granularity", type=str, choices=["pod", "domain", "pod_avg"], default="pod")
-    parser.add_argument("--restrict", type=str)
+    parser.add_argument("--restrict", type=str, help = 'use specific model name')
     args = parser.parse_args()
     main(args)

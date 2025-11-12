@@ -13,10 +13,12 @@ import os
 from functools import partial
 import optuna.visualization as vis
 from optuna.pruners import MedianPruner
+dropout= 0.3
+temperature = 0.6
 
 # ---------- 모델 정의 ----------
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.3, temperature=1.0):
+    def __init__(self, input_size, hidden_size=256, num_layers=2, dropout=dropout, temperature=temperature):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size, 1)
@@ -26,7 +28,7 @@ class LSTMModel(nn.Module):
         return self.fc(out[:, -1, :]).squeeze(-1) / self.temperature
 
 class GRUModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.3, temperature=1.0):
+    def __init__(self, input_size, hidden_size=256, num_layers=2, dropout=dropout, temperature=temperature):
         super().__init__()
         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size, 1)
@@ -50,7 +52,7 @@ class Attention(nn.Module):
         return attn @ v
 
 class GRUWithAttention(nn.Module):
-    def __init__(self, input_size, hidden_size=64, num_layers=1, dropout=0.3, temperature=1.0):
+    def __init__(self, input_size, hidden_size=256, num_layers=1, dropout=dropout, temperature=temperature):
         super().__init__()
         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.attn = Attention(hidden_size)
@@ -62,7 +64,7 @@ class GRUWithAttention(nn.Module):
         return self.fc(attn_out[:, -1, :]).squeeze(-1) / self.temperature
     
 class ConvGRU(nn.Module):
-    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.4, temperature=1.0):
+    def __init__(self, input_size, hidden_size=256, num_layers=1, dropout=dropout, temperature=temperature):
         super().__init__()
         self.conv1 = nn.Conv1d(input_size, input_size, kernel_size=5, padding=1)
         self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
@@ -440,4 +442,5 @@ def analyze_feature_shift(xs, ys, feature_names):
     # P-value 가 작은 feature 상위 3개 표시
     print("\n🔥 Top features with smallest P-value:")
     print(stats_df["p_value"].abs().sort_values(ascending=True).head(3))
+    print(f'Average P-value: {stats_df["p_value"].abs().mean()}')
     return stats_df

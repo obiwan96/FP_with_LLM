@@ -263,7 +263,7 @@ def main(args):
         with open(file_path, 'rb') as f:
             dataset= pkl.load(f)
         print(f'📁 Load datset from {file_path}')
-        X,y, timestamps, failures = dataset
+        X,y, timestamps, failures, feature_names = dataset
     else:
         if args.end is not None:
             end = to_rfc3339(datetime.fromisoformat(args.end.replace("Z", "+00:00")))
@@ -377,7 +377,7 @@ def main(args):
                 feats[feature_name] = np.log1p(feats[feature_name])
         X = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
         y = merged["label"].values
-        dataset = (X,y, timestamps, failures)
+        dataset = (X,y, timestamps, failures, feature_names)
         with open(file_path, 'wb') as f:
             pkl.dump(dataset, f)
         print(f'📁 Datset saved in {file_path}')
@@ -466,6 +466,7 @@ def main(args):
     for i in range(X_seq.shape[2]):  # feature dimension
         r, _ = pearsonr(X_seq[:, -1, i], y_seq)
         corrs.append(r)
+    print('[INFO] Here are results of correation')
     print(pd.Series(corrs, index=feature_names).sort_values(ascending=False))
     analyze_feature_shift(X_seq, y_seq, feature_names)
 
@@ -479,18 +480,19 @@ def main(args):
     cutoff_time = get_cutoff_time_by_failure_ratio(failures, train_ratio=args.train_ratio)
     X_train, X_test, y_train, y_test = split_by_cutoff(X_seq, y_seq, ts_seq, cutoff_time)
     assert(len(X_train)+len(X_test)==len(X_seq))
-    plt.figure(figsize=(10,2))
-    plt.scatter(ts_seq, np.zeros(len(ts_seq)), s=3, c='gray', label='Samples')
-    plt.scatter(ori_failure, np.full(len(ori_failure), 0.1), s=3, c='red', label='Failures')  # ✅ 수정된 부분
-    plt.scatter(failures, np.full(len(failures), 0.05), s=3, c='orange', label='Used Failures')  # 실제 학습에 사용된 failure
-    for rec_time in recoveries:
-        plt.axvline(rec_time, color='green', linestyle=':', alpha=0.5)
-    plt.axvline(cutoff_time, color='blue', linestyle='--', label='Cutoff')
-    plt.legend()
-    plt.title("Train/Test Split by Failure Ratio (Soft Dataset)")
-    save_path = os.path.join('tmp/', f"cutoff_visualization.png")
-    plt.savefig(save_path)
-    plt.close()
+    if not args.use_pickle:        
+        plt.figure(figsize=(10,2))
+        plt.scatter(ts_seq, np.zeros(len(ts_seq)), s=3, c='gray', label='Samples')
+        plt.scatter(ori_failure, np.full(len(ori_failure), 0.1), s=3, c='red', label='Failures')  # ✅ 수정된 부분
+        plt.scatter(failures, np.full(len(failures), 0.05), s=3, c='orange', label='Used Failures')  # 실제 학습에 사용된 failure
+        for rec_time in recoveries:
+            plt.axvline(rec_time, color='green', linestyle=':', alpha=0.5)
+        plt.axvline(cutoff_time, color='blue', linestyle='--', label='Cutoff')
+        plt.legend()
+        plt.title("Train/Test Split by Failure Ratio (Soft Dataset)")
+        save_path = os.path.join('tmp/', f"cutoff_visualization.png")
+        plt.savefig(save_path)
+        plt.close()
     # Normalization based on only train data
     N, T, D = X_train.shape
     # (N*T, D)로 reshape
@@ -583,6 +585,7 @@ def main(args):
     del model, optimizer
     torch.cuda.empty_cache()
     gc.collect()
+    return f1
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -603,5 +606,21 @@ if __name__ == "__main__":
     parser.add_argument("--use-pickle", action='store_true', help="using saved pickle file. if no, save the data file.")
     parser.add_argument("--single-domain", type=str, choices=["ran", "core"])
     parser.add_argument("--resource-only", action='store_true')
+    parser.add_argument("--test-mode", action='store_true')
     args = parser.parse_args()
-    main(args)
+    if args.test_mode:
+        results = []  # (win, hor, f1) 저장
+        for win in [5,10,15]:
+            args.win=win
+            for hor in [0,1,2,3,5]:
+                args.hor=hor
+                f1 = main(args)
+                results.append((win, hor, f1))
+        print("\n=== F1 Score Summary ===")
+        print(f"{'Window':>8} | {'Horizon':>8} | {'F1 Score':>8}")
+        print("-" * 32)
+        for win, hor, f1 in results:
+            print(f"{win:>8} | {hor:>8} | {f1:>8.4f}")
+        print("-" * 32)
+    else:
+        main(args)
