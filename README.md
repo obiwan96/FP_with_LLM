@@ -158,7 +158,7 @@ These will be cleaned and standardized in future releases.
 
 If you use this code in your research, please cite our paper:
 ```
-We submitted our paper in conference, and are waiting for the result.
+Sukhyun Nam, Wonseok Choi, James Won-Ki Hong, "MDAF-based Explainable Failure Prediction for Network Functions in 5G/6G", 2026 IEEE/IFIP Network Operations and Management Symposium (NOMS 2026), Rome, Italy, 18-22 May, 2026. (Accepted to appear)
 ```
 
 
