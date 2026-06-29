@@ -1,7 +1,7 @@
 import argparse
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from influxdb_client import InfluxDBClient
 from Prome_helper import PrometheusClient, to_rfc3339
 from sklearn.preprocessing import StandardScaler
@@ -18,6 +18,8 @@ from scipy.stats import pearsonr
 from sklearn.metrics import roc_auc_score, average_precision_score
 import os
 from learning_helper import *
+from GNN import GNNGRUModel, build_nf_node_features, build_nf_adjacency, detect_node_suffixes, make_soft_graph_dataset, make_gif_from_embeddings, NODE_NAMES, visualize_all_epochs_at_once
+dropout= 0.3
 import pickle as pkl
 warnings.filterwarnings("ignore")
 
@@ -258,12 +260,18 @@ def main(args):
     print(f"\n[INFO] Starting training with model={args.model}, granularity={args.granularity}, feature={args.feature}\n")
     file_path = f"tmp/data/{args.single_domain}{'resource' if args.resource_only else 'mdaf'}{args.feature}_{args.granularity}_{'sloasinput' if args.slo_as_input else ''}_stepsize{args.step}.pkl"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    graph_adj = None
     
     if args.use_pickle:
         with open(file_path, 'rb') as f:
-            dataset= pkl.load(f)
+            dataset = pkl.load(f)
         print(f'📁 Load datset from {file_path}')
-        X,y, timestamps, failures, feature_names = dataset
+        X, y, timestamps, failures, feature_names = dataset
+        if 'GNN' in args.model:
+            if X.ndim != 3:
+                raise ValueError("Pickled GNN dataset must contain node-feature tensors with shape [time, nodes, features].")
+            node_suffixes = detect_node_suffixes(feature_names, args.single_domain)
+            graph_adj = build_nf_adjacency(node_suffixes)
     else:
         if args.end is not None:
             end = to_rfc3339(datetime.fromisoformat(args.end.replace("Z", "+00:00")))
@@ -329,6 +337,14 @@ def main(args):
         # === 이후 failure label 태깅 (회복된 이후 데이터만 포함) ===
         failure_df = pd.DataFrame({"timestamp": failures})
         failure_df["label"] = 1
+
+        print("="*50)
+        print("🔍 [merge_asof 데이터 타입 검증]")
+        print(f"1. merged df의 'timestamp' 타입: {merged['timestamp'].dtype}")
+        print(f"2. failure_df의 'timestamp' 타입: {failure_df['timestamp'].dtype}")
+        print(f"3. tolerance 설정값: {pd.Timedelta(args.step)} (타입: {type(pd.Timedelta(args.step))})")
+        print("="*50)
+        failure_df['timestamp'] = pd.to_datetime(failure_df['timestamp'], unit='s')
         merged = pd.merge_asof(
             merged,
             failure_df,
@@ -365,23 +381,36 @@ def main(args):
         removed_cols = df_std[df_std == 0].index 
         print("[INFO] Removed columns with std=0:", list(removed_cols))
         feats = feats[valid_cols]
-        feature_names = list(feats.columns)
-        
+
         if args.feature == "diff":
             feats = feats.diff().fillna(0)
         elif args.feature == "var":
             feats = feats.rolling(window=3).var().fillna(0)
         else:
-            log_recommended_feature_list= analyze_features_cli(feats)
+            log_recommended_feature_list = analyze_features_cli(feats)
             for feature_name in log_recommended_feature_list:
                 feats[feature_name] = np.log1p(feats[feature_name])
-        X = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if 'GNN' in args.model:
+            if args.granularity != 'pod':
+                raise ValueError("GNN requires pod-level granularity to build node features.")
+            X, node_suffixes, node_metrics, graph_adj = build_nf_node_features(feats, args.single_domain)
+            feature_names = [f"{node}_{metric}" for node in node_suffixes for metric in node_metrics]
+        else:
+            feature_names = list(feats.columns)
+            X = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+        print(f"[INFO] Final feature shape: {X.shape}, feature names: {feature_names}")
+
+        if 'GNN' in args.model:
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
         y = merged["label"].values
-        dataset = (X,y, timestamps, failures, feature_names)
+        dataset = (X, y, timestamps, failures, feature_names)
         with open(file_path, 'wb') as f:
             pkl.dump(dataset, f)
         print(f'📁 Datset saved in {file_path}')
     if args.optuna:
+        if 'GNN' in args.model:
+            raise NotImplementedError("Optuna is not yet supported for GNN. Use GNN without --optuna.")
         if args.model:
             study = study_optuna(X, y, timestamps, failures, device, timeout = args.optuna*60*60, model_name=args.model)
             df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
@@ -427,15 +456,19 @@ def main(args):
                                                     alpha=best_params["alpha"],
                                                     gamma=best_params["gamma"])
     else:
-        X_seq, y_seq, ts_seq = make_soft_dataset(X, y, timestamps, args.win, args.hor, mode="linear")
-        if args.model == 'LSTM':
-            model = LSTMModel(input_size=X_seq.shape[2])
-        elif args.model == 'GRU':
-            model = GRUModel(input_size=X_seq.shape[2])
-        elif args.model == 'GRU_Att':
-            model = GRUWithAttention(input_size=X_seq.shape[2])
-        else: # CNV_GRU
-            model = ConvGRU(input_size=X_seq.shape[2])
+        if 'GNN' in args.model:
+            X_seq, y_seq, ts_seq = make_soft_graph_dataset(X, y, timestamps, args.win, args.hor, mode="linear")
+            model = GNNGRUModel(node_feature_dim=X_seq.shape[3])
+        else:
+            X_seq, y_seq, ts_seq = make_soft_dataset(X, y, timestamps, args.win, args.hor, mode="linear")
+            if args.model == 'LSTM':
+                model = LSTMModel(input_size=X_seq.shape[2])
+            elif args.model == 'GRU':
+                model = GRUModel(input_size=X_seq.shape[2])
+            elif args.model == 'GRU_Att':
+                model = GRUWithAttention(input_size=X_seq.shape[2])
+            else: # CNV_GRU
+                model = ConvGRU(input_size=X_seq.shape[2])
         model.to(device)
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -462,13 +495,18 @@ def main(args):
     
 
     X_seq = np.nan_to_num(X_seq, nan=0.0, posinf=0.0, neginf=0.0)
-    corrs=[]
-    for i in range(X_seq.shape[2]):  # feature dimension
-        r, _ = pearsonr(X_seq[:, -1, i], y_seq)
+    if X_seq.ndim == 4:
+        X_seq_analysis = X_seq.reshape(X_seq.shape[0], X_seq.shape[1], -1)
+    else:
+        X_seq_analysis = X_seq
+
+    corrs = []
+    for i in range(X_seq_analysis.shape[2]):
+        r, _ = pearsonr(X_seq_analysis[:, -1, i], y_seq)
         corrs.append(r)
     print('[INFO] Here are results of correation')
     print(pd.Series(corrs, index=feature_names).sort_values(ascending=False))
-    analyze_feature_shift(X_seq, y_seq, feature_names)
+    analyze_feature_shift(X_seq_analysis, y_seq, feature_names)
 
     '''split = int(len(X_seq) * args.train_ratio)
     split_bound = random.randrange(0,split)
@@ -477,44 +515,69 @@ def main(args):
     X_train, y_train = np.append(X_seq[:split_bound],X_seq[split_bound+test_num:],axis=0), np.append(y_seq[:split_bound],y_seq[split_bound+test_num:],axis=0)
     X_test, y_test = X_seq[split_bound:split_bound+test_num], y_seq[split_bound:split_bound+test_num]'''
     #y_seq = smooth_labels(y_seq, eps=0.05)
-    cutoff_time = get_cutoff_time_by_failure_ratio(failures, train_ratio=args.train_ratio)
-    X_train, X_test, y_train, y_test = split_by_cutoff(X_seq, y_seq, ts_seq, cutoff_time)
-    assert(len(X_train)+len(X_test)==len(X_seq))
-    if not args.use_pickle:        
-        plt.figure(figsize=(10,2))
-        plt.scatter(ts_seq, np.zeros(len(ts_seq)), s=3, c='gray', label='Samples')
-        plt.scatter(ori_failure, np.full(len(ori_failure), 0.1), s=3, c='red', label='Failures')  # ✅ 수정된 부분
-        plt.scatter(failures, np.full(len(failures), 0.05), s=3, c='orange', label='Used Failures')  # 실제 학습에 사용된 failure
-        for rec_time in recoveries:
-            plt.axvline(rec_time, color='green', linestyle=':', alpha=0.5)
-        plt.axvline(cutoff_time, color='blue', linestyle='--', label='Cutoff')
-        plt.legend()
-        plt.title("Train/Test Split by Failure Ratio (Soft Dataset)")
-        save_path = os.path.join('tmp/', f"cutoff_visualization.png")
-        plt.savefig(save_path)
-        plt.close()
+    if not args.gnn_test:
+        cutoff_time = get_cutoff_time_by_failure_ratio(failures, train_ratio=args.train_ratio)
+        X_train, X_test, y_train, y_test = split_by_cutoff(X_seq, y_seq, ts_seq, cutoff_time)
+        assert(len(X_train)+len(X_test)==len(X_seq))
+        if not args.use_pickle:        
+            plt.figure(figsize=(10,2))
+            plt.scatter(ts_seq, np.zeros(len(ts_seq)), s=3, c='gray', label='Samples')
+            plt.scatter(ori_failure, np.full(len(ori_failure), 0.1), s=3, c='red', label='Failures')  # ✅ 수정된 부분
+            plt.scatter(failures, np.full(len(failures), 0.05), s=3, c='orange', label='Used Failures')  # 실제 학습에 사용된 failure
+            for rec_time in recoveries:
+                plt.axvline(rec_time, color='green', linestyle=':', alpha=0.5)
+            plt.axvline(cutoff_time, color='blue', linestyle='--', label='Cutoff')
+            plt.legend()
+            plt.title("Train/Test Split by Failure Ratio (Soft Dataset)")
+            save_path = os.path.join('tmp/', f"cutoff_visualization.png")
+            plt.savefig(save_path)
+            plt.close()
+    else:
+        X_train, y_train = X_seq, y_seq
+        X_test, y_test = None, None
+        test_loader = None
+        f1 = None
     # Normalization based on only train data
-    N, T, D = X_train.shape
-    # (N*T, D)로 reshape
-    X_train_flat = X_train.reshape(-1, D)
-    X_test_flat  = X_test.reshape(-1, D)
+    if X_train.ndim == 4:
+        samples, T, nodes, feats = X_train.shape
+        D = nodes * feats
+        X_train_flat = X_train.reshape(samples * T, D)
+        if not args.gnn_test:
+            X_test_flat = X_test.reshape(X_test.shape[0] * X_test.shape[1], D)
+    else:
+        samples, T, D = X_train.shape
+        X_train_flat = X_train.reshape(-1, D)
+        X_test_flat = X_test.reshape(-1, D)
+
     scaler = StandardScaler()
     X_train_scaled_flat = scaler.fit_transform(X_train_flat)
-    X_test_scaled_flat  = scaler.transform(X_test_flat)
-    X_train = X_train_scaled_flat.reshape(N, T, D)
-    X_test  = X_test_scaled_flat.reshape(X_test.shape[0], T, D)
+    if not args.gnn_test:
+        X_test_scaled_flat = scaler.transform(X_test_flat)
+
+    if X_train.ndim == 4:
+        X_train = X_train_scaled_flat.reshape(samples, T, nodes, feats)
+        if not args.gnn_test:
+            X_test = X_test_scaled_flat.reshape(X_test.shape[0], T, nodes, feats)
+    else:
+        X_train = X_train_scaled_flat.reshape(samples, T, D)
+        X_test = X_test_scaled_flat.reshape(X_test.shape[0], T, D)
+
     X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
-    X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    if not args.gnn_test:
+        X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Oversampling
     normal_idx = np.where(y_train == 0)[0]
     abnormal_idx = np.where(y_train == 1)[0]
     n_normal, n_abnormal = len(normal_idx), len(abnormal_idx)    
     print(f"[INFO] Train Normal={n_normal}, Abnormal={n_abnormal}")
-    normal_idx_test = np.where(y_test == 0)[0]
-    abnormal_idx_test = np.where(y_test == 1)[0]
-    n_normal_test, n_abnormal_test = len(normal_idx_test), len(abnormal_idx_test)
-    print(f"[INFO] Test Normal={n_normal_test}, Abnormal={n_abnormal_test}")
+    
+    if not args.gnn_test:
+        normal_idx_test = np.where(y_test == 0)[0]
+        abnormal_idx_test = np.where(y_test == 1)[0]
+        n_normal_test, n_abnormal_test = len(normal_idx_test), len(abnormal_idx_test)
+        print(f"[INFO] Test Normal={n_normal_test}, Abnormal={n_abnormal_test}")
     # Weigth 값은 oversampling 이전에 계산.
     class_counts = np.bincount(y_train.astype(int))
     weights = class_counts.sum() / (2.0 * class_counts)
@@ -537,59 +600,74 @@ def main(args):
     print(f"Train data shape: {X_train.shape}, {y_train.shape}")
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     y_train_t = torch.tensor(y_train, dtype=torch.float32)
-    X_test_t = torch.tensor(X_test, dtype=torch.float32)
-    y_test_t = torch.tensor(y_test, dtype=torch.float32)
-
-    print(f'[INFO] train data max value: {np.max(X_train)},  min value: {np.min(X_train)}')
+    
+    if not args.gnn_test:
+        X_test_t = torch.tensor(X_test, dtype=torch.float32)
+        y_test_t = torch.tensor(y_test, dtype=torch.float32)
+        print(f'[INFO] train data max value: {np.max(X_train)},  min value: {np.min(X_train)}')
     #X_train, y_train = torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long)
     #X_test, y_test = torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long)
 
     train_loader = DataLoader(TensorDataset(X_train_t, y_train_t), batch_size=args.batch, shuffle=False)
-    test_loader = DataLoader(TensorDataset(X_test_t, y_test_t), batch_size=args.batch, num_workers=0)
+    if not args.gnn_test:
+        test_loader = DataLoader(TensorDataset(X_test_t, y_test_t), batch_size=args.batch, num_workers=0)
 
-    
     weights = torch.tensor(weights, dtype=torch.float32)
     #criterion = nn.CrossEntropyLoss()
     #optimizer = optim.Adam(model.parameters(), lr=args.lr)
     #criterion = nn.CrossEntropyLoss(weight=weights)
     
     #criterion = nn.BCEWithLogitsLoss()
+    adj_tensor = graph_adj.to(device) if graph_adj is not None else None
     # training
+    if X_train.ndim == 4:
+        all_embeddings = []
     for epoch in range(args.epochs):
-        train_and_eval(model, train_loader, test_loader, optimizer, criterion, device, scheduler)
+        _, _, _, _, emb_last_step = train_and_eval(model, train_loader, test_loader, optimizer, criterion, device, scheduler, 
+                       adj=adj_tensor, epoch_num= epoch, skip_eval=args.gnn_test)
+        if emb_last_step is not None:
+            all_embeddings.append(emb_last_step)
+    if X_train.ndim == 4:
+        visualize_all_epochs_at_once(all_embeddings, NODE_NAMES)
+        make_gif_from_embeddings() 
+    if not args.gnn_test:
+        preds, trues = [], []
+        model.eval()
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                xb = xb.to(device)
+                if adj_tensor is not None and getattr(model, "requires_graph", False):
+                    out = torch.sigmoid(model(xb, adj_tensor)).cpu().numpy()
+                else:                
+                    out = torch.sigmoid(model(xb)).cpu().numpy()
+                preds.extend(out)
+                trues.extend(yb.cpu().numpy())
+        preds, trues = np.array(preds), np.array(trues)
+        f1 = f1_score((trues > 0.5).astype(int), preds > 0.5)
+        auc = roc_auc_score((trues > 0.5).astype(int), preds)
+        pr = average_precision_score((trues > 0.5).astype(int), preds)
 
-    preds, trues = [], []
-    model.eval()
-    with torch.no_grad():
-        for xb, yb in test_loader:
-            xb = xb.to(device)
-            out = torch.sigmoid(model(xb)).cpu().numpy()
-            preds.extend(out)
-            trues.extend(yb.numpy())
-    preds, trues = np.array(preds), np.array(trues)
-    f1 = f1_score((trues > 0.5).astype(int), preds > 0.5)
-    auc = roc_auc_score((trues > 0.5).astype(int), preds)
-    pr = average_precision_score((trues > 0.5).astype(int), preds)
-
-    # 요약
-    print("\n[RESULT] Test Set Performance:")
-    print("F1-score: {:.4f}".format(f1))
-    print("AUROC: {:.4f}".format(auc))
-    print("AUPRC: {:.4f}".format(pr))
-    print("[INFO] Saving SHAP-related resources...")
-    torch.save(model.state_dict(), f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}.pt")               # 학습된 가중치
-    joblib.dump(scaler, f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}_scaler.joblib")                     # normalization 객체
-    pd.Series(feature_names).to_csv("feature_names.csv", index=False)  # feature 이름
-    np.save(f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}_bg_samples.npy", X_train[:512])             # 학습셋 일부 (SHAP background)
-    print(f"Model saved in 'tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}.pt'.")
+        # 요약
+        print("\n[RESULT] Test Set Performance:")
+        print("F1-score: {:.4f}".format(f1))
+        print("AUROC: {:.4f}".format(auc))
+        print("AUPRC: {:.4f}".format(pr))
+        print("[INFO] Saving SHAP-related resources...")
+        torch.save(model.state_dict(), f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}.pt")               # 학습된 가중치
+        joblib.dump(scaler, f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}_scaler.joblib")                     # normalization 객체
+        pd.Series(feature_names).to_csv("feature_names.csv", index=False)  # feature 이름
+        np.save(f"tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}_bg_samples.npy", X_train[:512])             # 학습셋 일부 (SHAP background)
+        print(f"Model saved in 'tmp/models/{args.model}_model_win{args.win}_hor{args.hor}_{int(f1*100)}.pt'.")
     del model, optimizer
     torch.cuda.empty_cache()
     gc.collect()
     return f1
 
 if __name__ == "__main__":
+    one_day_ago = datetime.now(timezone.utc) - timedelta(days=3)
+    one_day_ago = one_day_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start", type=str, default="2025-10-14T10:00:00Z")
+    parser.add_argument("--start", type=str, default=one_day_ago)#"2025-10-14T10:00:00Z")
     parser.add_argument("--end", type=str)
     parser.add_argument("--win", type=int, default=10)
     parser.add_argument("--hor", type=int, default=5)
@@ -600,13 +678,14 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--granularity", type=str, choices=["pod", "domain", "pod_avg"], default="pod")
     parser.add_argument("--feature", type=str, choices=["raw", "diff", "var"], default="raw")
-    parser.add_argument("--model", type=str, choices=["LSTM", "GRU", "GRU_Att", "CNV_GRU"])
+    parser.add_argument("--model", type=str, choices=["LSTM", "GRU", "GRU_Att", "CNV_GRU", "GNN_GRU", "GNN"])
     parser.add_argument("--slo-as-input", action='store_true')
     parser.add_argument("--optuna", type=int, help='To use Optuna, put limit ime as hours.')
     parser.add_argument("--use-pickle", action='store_true', help="using saved pickle file. if no, save the data file.")
     parser.add_argument("--single-domain", type=str, choices=["ran", "core"])
     parser.add_argument("--resource-only", action='store_true')
     parser.add_argument("--test-mode", action='store_true')
+    parser.add_argument("--gnn-test", action='store_true', help="Test GNN model learning without abnormal data")
     args = parser.parse_args()
     if args.test_mode:
         results = []  # (win, hor, f1) 저장

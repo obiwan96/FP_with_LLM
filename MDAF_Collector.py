@@ -14,7 +14,7 @@ Prometheus(메트릭)와 Loki(로그)로부터 RAN/Transport/Core/App 지표를 
   - Loki 라벨은 {namespace="oai"} 등 환경에 맞춰 조정
 
 사용 예:
-  python net_k8s_collectors.py --prom http://127.0.0.1:9090 --loki http://127.0.0.1:3100 \
+  python MDAF_Collector.py --prom http://127.0.0.1:9090 --loki http://127.0.0.1:3100 \
     --ns oai --upf_pod oai-upf-0 --iface eth0 \
     --run all --window 15m --step 30s
 

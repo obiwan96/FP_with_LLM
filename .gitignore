@@ -7,3 +7,4 @@ __pycache__/
 *.tpl
 ueransim-ue-k6/
 !ueransim-ue-k6/templates/ue-k6-script.yaml
+lib/

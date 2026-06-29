@@ -13,6 +13,7 @@ import os
 from functools import partial
 import optuna.visualization as vis
 from optuna.pruners import MedianPruner
+from GNN import visualize_topology_dynamics, explain_node_contributions, visual_node_embeddings, NODE_NAMES
 dropout= 0.3
 temperature = 0.6
 
@@ -215,27 +216,53 @@ def smooth_labels(y, eps=0.05):
     return y_smooth
 
 # feature 분석/ 학습 관련
-def train_and_eval(model, train_loader, val_loader, optimizer, criterion, device, scheduler=None):
+def train_and_eval(model, train_loader, val_loader, optimizer, criterion, device, scheduler=None, adj=None, epoch_num=None, skip_eval=False):
     model.train()
     for xb, yb in train_loader:
         xb, yb = xb.to(device), yb.to(device)
         optimizer.zero_grad()
-        out = model(xb)
+        if adj is not None and getattr(model, "requires_graph", False):
+            out = model(xb, adj)
+        else:
+            out = model(xb)
         loss = criterion(out, yb)
         loss.backward()
         optimizer.step()
     if scheduler:
         scheduler.step(loss.item())
+    emb_last_step = None
+    if epoch_num is not None and epoch_num % 20 == 0 and adj is not None and getattr(model, "requires_graph", False):
+        sample_batch = next(iter(train_loader))
+        sample_xb = sample_batch[0][:1].numpy() # [1, time, nodes, features] 크기로 슬라이싱
+        
+        # 1) Saliency Map 기반 노드 중요도 계산
+        scores = explain_node_contributions(model, sample_xb, adj, NODE_NAMES, device)
+        
+        # 2) Pyvis를 활용한 토폴로지 시각화 파일 저장
+        visualize_topology_dynamics(
+            adj_matrix=adj, 
+            node_scores=scores, 
+            node_names=NODE_NAMES, 
+            filename=f"tmp/gnn/topology_epoch_{epoch_num}.html"
+        )
+        
+        # 3) (선택) 노드 임베딩 공간 분포 시각화 (t-SNE)
+        emb_last_step = visual_node_embeddings(model, sample_xb, adj, NODE_NAMES, epoch_num, device)
 
+    if skip_eval:
+        return 0, 0, 0, 0, emb_last_step
     # --- Validation ---
     model.eval()
     preds, trues = [], []
     with torch.no_grad():
         for xb, yb in val_loader:
-            xb = xb.to(device)
-            out = model(xb)
+            xb, yb = xb.to(device), yb.to(device)
+            if adj is not None and getattr(model, "requires_graph", False):
+                out = model(xb, adj)
+            else:
+                out = model(xb)
             preds.extend(torch.sigmoid(out).cpu().numpy())
-            trues.extend(yb.numpy())
+            trues.extend(yb.cpu().numpy())
     preds, trues = np.array(preds), np.array(trues)
     ths = np.linspace(0.1, 0.9, 9)
     f1s = [f1_score((trues > 0.5).astype(int), (preds > t).astype(int)) for t in ths]
@@ -249,8 +276,7 @@ def train_and_eval(model, train_loader, val_loader, optimizer, criterion, device
         roc = pr = 0
         print (f'[ERROR] exception ccured in roc, precision score. {E}')
         print(np.unique(trues, return_counts=True))
-
-    return f1_best, roc, pr, best_th
+    return f1_best, roc, pr, best_th, emb_last_step
 
 # ✅ Optuna objective
 def objective(trial, X_raw, y_raw, timestamps, failures, device, model_name = None):
