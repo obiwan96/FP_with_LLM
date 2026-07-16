@@ -299,6 +299,8 @@ def main(args):
         recoveries = events_df[events_df["type"] == "recovery"]["timestamp"].tolist()
         
         # recovery가 없을 경우 대비
+        if args.unsupervised and len(failures) > 0:
+            print('[WARN] Unsupervised mode should use only normal data')
         if not failures:
             print("[INFO] No failure events found.")
         elif not recoveries:
@@ -452,7 +454,7 @@ def main(args):
                          temperature=best_params["temperature"]).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=best_params["lr"])
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3)
-        criterion = lambda logits, targets: focal_loss_ce(logits, targets,
+        criterion = nn.MSELoss() if args.unsupervised else lambda logits, targets: focal_loss_ce(logits, targets,
                                                     alpha=best_params["alpha"],
                                                     gamma=best_params["gamma"])
     else:
@@ -474,7 +476,7 @@ def main(args):
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=5, verbose=True
         )
-        criterion = lambda logits, targets: focal_loss_ce(logits, targets,alpha=0.9)
+        criterion = nn.MSELoss() if args.unsupervised else lambda logits, targets: focal_loss_ce(logits, targets,alpha=0.9)
     plt.figure(figsize=(10,3))
     plt.plot(y, label='original anomaly flag')
     plt.title("Original Label (binary)")
@@ -686,6 +688,7 @@ if __name__ == "__main__":
     parser.add_argument("--resource-only", action='store_true')
     parser.add_argument("--test-mode", action='store_true')
     parser.add_argument("--gnn-test", action='store_true', help="Test GNN model learning without abnormal data")
+    parser.add_argument("--unsupervised", action='store_true', help="Use unsupervised learning")
     args = parser.parse_args()
     if args.test_mode:
         results = []  # (win, hor, f1) 저장
